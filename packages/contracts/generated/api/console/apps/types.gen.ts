@@ -1318,30 +1318,12 @@ export type DeletedTool = {
 }
 
 export type ModelConfig = {
-  agent_mode?: JsonValue | null
-  annotation_reply?: JsonValue | null
-  chat_prompt_config?: JsonValue | null
-  completion_prompt_config?: JsonValue | null
-  created_at?: number | null
-  created_by?: string | null
-  dataset_configs?: JsonValue | null
-  dataset_query_variable?: string | null
-  external_data_tools?: JsonValue | null
-  file_upload?: JsonValue | null
-  model?: JsonValue | null
-  more_like_this?: JsonValue | null
-  opening_statement?: string | null
-  pre_prompt?: string | null
-  prompt_type?: string | null
-  retriever_resource?: JsonValue | null
-  sensitive_word_avoidance?: JsonValue | null
-  speech_to_text?: JsonValue | null
-  suggested_questions?: JsonValue | null
-  suggested_questions_after_answer?: JsonValue | null
-  text_to_speech?: JsonValue | null
-  updated_at?: number | null
-  updated_by?: string | null
-  user_input_form?: JsonValue | null
+  completion_params?: {
+    [key: string]: unknown
+  }
+  mode: LlmMode
+  name: string
+  provider: string
 }
 
 export type AppDetailSiteResponse = {
@@ -2201,6 +2183,8 @@ export type ModelConfigPartial = {
   updated_at?: number | null
   updated_by?: string | null
 }
+
+export type LlmMode = 'chat' | 'completion'
 
 export type Type = 'github' | 'marketplace' | 'package'
 
@@ -3071,7 +3055,7 @@ export type WorkflowCommentBasicListWritable = {
 }
 
 export type WorkflowCommentMentionUsersPayloadWritable = {
-  users: Array<AccountWithRoleWritable>
+  users: Array<AccountWithRoleResponseWritable>
 }
 
 export type WorkflowCommentDetailWritable = {
@@ -3164,7 +3148,7 @@ export type WorkflowCommentBasicWritable = {
   updated_at?: number | null
 }
 
-export type AccountWithRoleWritable = {
+export type AccountWithRoleResponseWritable = {
   avatar?: string | null
   created_at?: number | null
   email: string
