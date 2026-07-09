@@ -165,12 +165,15 @@ def create_spec_app() -> Flask:
 
     from controllers.console import bp as console_bp
     from controllers.console import console_ns
+    from controllers.console.routes import load_console_routes
     from controllers.openapi import bp as openapi_bp
     from controllers.openapi import openapi_ns
     from controllers.service_api import bp as service_api_bp
     from controllers.service_api import service_api_ns
     from controllers.web import bp as web_bp
     from controllers.web import web_ns
+
+    load_console_routes()
 
     app.register_blueprint(console_bp)
     app.register_blueprint(web_bp)

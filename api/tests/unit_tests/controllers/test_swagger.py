@@ -157,10 +157,12 @@ def test_uuid_path_format_is_derived_from_route_converter():
 def test_openapi_json_endpoints_render(monkeypatch: pytest.MonkeyPatch):
     from configs import dify_config
     from controllers.console import bp as console_bp
+    from controllers.console.routes import load_console_routes
     from controllers.service_api import bp as service_api_bp
     from controllers.web import bp as web_bp
 
     monkeypatch.setattr(dify_config, "SWAGGER_UI_ENABLED", True)
+    load_console_routes()
 
     app = Flask(__name__)
     app.config["TESTING"] = True
@@ -557,8 +559,10 @@ def test_service_openapi_documents_auth_and_compatibility_payloads(monkeypatch: 
 def test_console_account_avatar_query_param_renders_as_query(monkeypatch: pytest.MonkeyPatch):
     from configs import dify_config
     from controllers.console import bp as console_bp
+    from controllers.console.routes import load_console_routes
 
     monkeypatch.setattr(dify_config, "SWAGGER_UI_ENABLED", True)
+    load_console_routes()
 
     app = Flask(__name__)
     app.config["TESTING"] = True

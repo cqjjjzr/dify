@@ -28,6 +28,7 @@ def init_app(app: DifyApp):
     # register blueprint routers
 
     from controllers.console import bp as console_app_bp
+    from controllers.console.routes import load_console_routes
     from controllers.files import bp as files_bp
     from controllers.inner_api import bp as inner_api_bp
     from controllers.mcp import bp as mcp_bp
@@ -35,6 +36,8 @@ def init_app(app: DifyApp):
     from controllers.service_api import bp as service_api_bp
     from controllers.trigger import bp as trigger_bp
     from controllers.web import bp as web_bp
+
+    load_console_routes()
 
     _apply_cors_once(
         service_api_bp,

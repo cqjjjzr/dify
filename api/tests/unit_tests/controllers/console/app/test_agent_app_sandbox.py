@@ -8,7 +8,7 @@ import pytest
 from dify_agent.client import DifyAgentClientError, DifyAgentHTTPError, DifyAgentTimeoutError
 from dify_agent.protocol import SandboxListResponse, SandboxReadResponse
 
-from controllers.console import agent_app_sandbox as module
+from controllers.console.app import agent_app_sandbox as module
 from models.model import App, AppMode, IconType
 from services.agent_app_sandbox_service import AgentSandboxInfo, AgentSandboxInspectorError, AgentSandboxUploadDownload
 
