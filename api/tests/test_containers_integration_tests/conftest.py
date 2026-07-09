@@ -33,6 +33,13 @@ from tests.test_containers_integration_tests.transactional import DatabaseState,
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 _TEST_SANDBOX_IMAGE = os.getenv("TEST_SANDBOX_IMAGE", "langgenius/dify-sandbox:0.2.12")
+_TEST_STORAGE_ROOT = os.getenv("DIFY_TESTCONTAINERS_STORAGE_ROOT", "/tmp/dify-storage")
+
+# Controller modules can initialize storage while pytest is still collecting.
+# Pin test storage before those modules import so no artifacts reach the worktree.
+os.environ["STORAGE_TYPE"] = "opendal"
+os.environ["OPENDAL_SCHEME"] = "fs"
+os.environ["OPENDAL_FS_ROOT"] = _TEST_STORAGE_ROOT
 
 DEFAULT_SANDBOX_TEST_IMAGE = "langgenius/dify-sandbox:0.2.14"
 SANDBOX_TEST_IMAGE_ENV = "DIFY_SANDBOX_TEST_IMAGE"
@@ -206,9 +213,9 @@ class DifyTestContainers:
                 with _auto_close(conn.cursor()) as cursor:
                     cursor.execute("CREATE DATABASE dify_plugin;")
 
-        os.environ.setdefault("STORAGE_TYPE", "opendal")
-        os.environ.setdefault("OPENDAL_SCHEME", "fs")
-        os.environ.setdefault("OPENDAL_FS_ROOT", "/tmp/dify-storage")
+        os.environ["STORAGE_TYPE"] = "opendal"
+        os.environ["OPENDAL_SCHEME"] = "fs"
+        os.environ["OPENDAL_FS_ROOT"] = _TEST_STORAGE_ROOT
         self._started_services.add("postgres")
 
     def _start_redis(self) -> None:
