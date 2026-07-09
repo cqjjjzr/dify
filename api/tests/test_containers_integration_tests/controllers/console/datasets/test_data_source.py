@@ -317,7 +317,7 @@ class TestDataSourceNotionListApi:
 
         assert status == 200
 
-    def test_get_invalid_dataset_type(self, app: Flask, current_user: Account, mock_engine: None) -> None:
+    def test_get_invalid_dataset_type(self, app: Flask, current_user: Account) -> None:
         api = DataSourceNotionListApi()
         method = inspect.unwrap(api.get)
 
