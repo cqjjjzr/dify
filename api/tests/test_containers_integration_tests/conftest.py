@@ -26,7 +26,6 @@ from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 from testcontainers.postgres import PostgresContainer
 from testcontainers.redis import RedisContainer
 
-from app_factory import create_app
 from extensions.ext_database import db
 from tests.test_containers_integration_tests.transactional import DatabaseState, bind_test_transaction
 
@@ -467,6 +466,8 @@ def _create_app_with_containers() -> Flask:
 
     # Create and configure the Flask application
     logger.info("Initializing Flask application...")
+    from app_factory import create_app
+
     sio_app, app = create_app()
     logger.info("Flask application created successfully")
 
