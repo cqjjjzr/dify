@@ -115,11 +115,11 @@ class TestMessageValidators:
 
 
 def test_chat_message_list_not_found(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
 
     response = test_client_with_containers.get(
         f"/console/api/apps/{app.id}/chat-messages",
@@ -134,15 +134,15 @@ def test_chat_message_list_not_found(
 
 
 def test_chat_message_list_success(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
-    conversation = _create_conversation(db_session_with_containers, app.id, account.id, app.mode)
-    _create_message(db_session_with_containers, app.id, conversation.id, account.id, created_at_offset_seconds=0)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
+    conversation = _create_conversation(transactional_db_session, app.id, account.id, app.mode)
+    _create_message(transactional_db_session, app.id, conversation.id, account.id, created_at_offset_seconds=0)
     second = _create_message(
-        db_session_with_containers,
+        transactional_db_session,
         app.id,
         conversation.id,
         account.id,
@@ -173,11 +173,11 @@ def test_chat_message_list_success(
 
 
 def test_message_feedback_not_found(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
 
     response = test_client_with_containers.post(
         f"/console/api/apps/{app.id}/feedbacks",
@@ -192,13 +192,13 @@ def test_message_feedback_not_found(
 
 
 def test_message_feedback_success(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
-    conversation = _create_conversation(db_session_with_containers, app.id, account.id, app.mode)
-    message = _create_message(db_session_with_containers, app.id, conversation.id, account.id)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
+    conversation = _create_conversation(transactional_db_session, app.id, account.id, app.mode)
+    message = _create_message(transactional_db_session, app.id, conversation.id, account.id)
 
     response = test_client_with_containers.post(
         f"/console/api/apps/{app.id}/feedbacks",
@@ -209,7 +209,7 @@ def test_message_feedback_success(
     assert response.status_code == 200
     assert response.get_json() == {"result": "success"}
 
-    feedback = db_session_with_containers.scalar(
+    feedback = transactional_db_session.scalar(
         select(MessageFeedback).where(MessageFeedback.message_id == message.id)
     )
     assert feedback is not None
@@ -218,14 +218,14 @@ def test_message_feedback_success(
 
 
 def test_message_annotation_count(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
-    conversation = _create_conversation(db_session_with_containers, app.id, account.id, app.mode)
-    message = _create_message(db_session_with_containers, app.id, conversation.id, account.id)
-    db_session_with_containers.add(
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
+    conversation = _create_conversation(transactional_db_session, app.id, account.id, app.mode)
+    message = _create_message(transactional_db_session, app.id, conversation.id, account.id)
+    transactional_db_session.add(
         MessageAnnotation(
             app_id=app.id,
             conversation_id=conversation.id,
@@ -235,7 +235,7 @@ def test_message_annotation_count(
             account_id=account.id,
         )
     )
-    db_session_with_containers.commit()
+    transactional_db_session.commit()
 
     response = test_client_with_containers.get(
         f"/console/api/apps/{app.id}/annotations/count",
@@ -247,11 +247,11 @@ def test_message_annotation_count(
 
 
 def test_message_suggested_questions_success(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
     message_id = str(uuid4())
 
     with patch(
@@ -283,11 +283,11 @@ def test_message_suggested_questions_errors(
     exc: Exception,
     expected_status: int,
     expected_code: str,
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
     message_id = str(uuid4())
 
     with patch(
@@ -306,11 +306,11 @@ def test_message_suggested_questions_errors(
 
 
 def test_message_feedback_export_success(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
 
     with patch("services.feedback_service.FeedbackService.export_feedbacks", return_value={"exported": True}):
         response = test_client_with_containers.get(
@@ -323,13 +323,13 @@ def test_message_feedback_export_success(
 
 
 def test_message_api_get_success(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
-    conversation = _create_conversation(db_session_with_containers, app.id, account.id, app.mode)
-    message = _create_message(db_session_with_containers, app.id, conversation.id, account.id)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
+    conversation = _create_conversation(transactional_db_session, app.id, account.id, app.mode)
+    message = _create_message(transactional_db_session, app.id, conversation.id, account.id)
 
     with patch(
         "controllers.console.app.message.attach_message_extra_contents",

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 
-from flask.testing import FlaskClient
 from sqlalchemy.orm import Session
 
 from models.dataset import ExternalKnowledgeApis
 from tests.test_containers_integration_tests.controllers.console.helpers import (
-    authenticate_console_client,
+    AuthenticatedConsoleClient,
     create_console_account_and_tenant,
 )
+from tests.test_containers_integration_tests.transactional import DatabaseState
 
 
 def _create_external_api(
@@ -40,42 +40,46 @@ def _create_external_api(
 
 
 def test_external_api_template_list_filters_paginates_and_scopes_to_authenticated_tenant(
-    db_session_with_containers: Session,
-    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+    authenticated_console_client: AuthenticatedConsoleClient,
+    database_state: DatabaseState,
 ) -> None:
     """Exercise the real list route, including query parsing, DB lookup, and tenant isolation."""
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    foreign_account, foreign_tenant = create_console_account_and_tenant(db_session_with_containers)
+    account = authenticated_console_client.account
+    tenant = authenticated_console_client.tenant
+    test_client_with_containers = authenticated_console_client.client
+    foreign_account, foreign_tenant = create_console_account_and_tenant(transactional_db_session)
     account_id = account.id
     tenant_id = tenant.id
     foreign_account_id = foreign_account.id
     foreign_tenant_id = foreign_tenant.id
-    headers = authenticate_console_client(test_client_with_containers, account)
+    headers = authenticated_console_client.headers
 
     _create_external_api(
-        db_session_with_containers,
+        transactional_db_session,
         tenant_id=tenant_id,
         account_id=account_id,
         name="Alpha Primary",
     )
     _create_external_api(
-        db_session_with_containers,
+        transactional_db_session,
         tenant_id=tenant_id,
         account_id=account_id,
         name="Alpha Secondary",
     )
     _create_external_api(
-        db_session_with_containers,
+        transactional_db_session,
         tenant_id=tenant_id,
         account_id=account_id,
         name="Beta Unmatched",
     )
     _create_external_api(
-        db_session_with_containers,
+        transactional_db_session,
         tenant_id=foreign_tenant_id,
         account_id=foreign_account_id,
         name="Alpha Foreign",
     )
+    assert database_state.count(ExternalKnowledgeApis) == 4
 
     response = test_client_with_containers.get(
         "/console/api/datasets/external-knowledge-api?page=1&limit=1&keyword=Alpha",

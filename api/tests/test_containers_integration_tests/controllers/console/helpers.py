@@ -2,7 +2,8 @@
 
 import uuid
 from collections.abc import Callable
-from typing import cast
+from dataclasses import dataclass
+from typing import Protocol, cast
 
 from flask.testing import FlaskClient
 from sqlalchemy import select
@@ -18,6 +19,18 @@ from models.model import App, AppMode
 from services.account_service import AccountService
 
 
+class ConsoleAccountFactory(Protocol):
+    def __call__(self, *, role: TenantAccountRole = TenantAccountRole.OWNER) -> tuple[Account, Tenant]: ...
+
+
+@dataclass(frozen=True)
+class AuthenticatedConsoleClient:
+    client: FlaskClient
+    headers: dict[str, str]
+    account: Account
+    tenant: Tenant
+
+
 def ensure_dify_setup(db_session: Session) -> None:
     """Create a setup marker once so setup-protected console routes can be exercised."""
     if db_session.scalar(select(DifySetup).limit(1)) is not None:
@@ -27,7 +40,11 @@ def ensure_dify_setup(db_session: Session) -> None:
     db_session.commit()
 
 
-def create_console_account_and_tenant(db_session: Session) -> tuple[Account, Tenant]:
+def create_console_account_and_tenant(
+    db_session: Session,
+    *,
+    role: TenantAccountRole = TenantAccountRole.OWNER,
+) -> tuple[Account, Tenant]:
     """Create an initialized owner account with a current tenant."""
     account = Account(
         email=f"test-{uuid.uuid4()}@example.com",
@@ -47,7 +64,7 @@ def create_console_account_and_tenant(db_session: Session) -> tuple[Account, Ten
         TenantAccountJoin(
             tenant_id=tenant.id,
             account_id=account.id,
-            role=TenantAccountRole.OWNER,
+            role=role,
             current=True,
         )
     )

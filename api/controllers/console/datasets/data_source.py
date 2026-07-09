@@ -9,7 +9,7 @@ from flask_restx import Resource
 from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from werkzeug.exceptions import NotFound
+from werkzeug.exceptions import BadRequest, NotFound
 
 from controllers.common.fields import SimpleResultResponse, TextContentResponse
 from controllers.common.schema import query_params_from_model, register_response_schema_models, register_schema_models
@@ -208,14 +208,14 @@ class DataSourceApi(Resource):
                     data_source_binding.disabled = False
                     data_source_binding.updated_at = naive_utc_now()
                 else:
-                    raise ValueError("Data source is not disabled.")
+                    raise BadRequest("Data source is not disabled.")
             # disable binding
             case "disable":
                 if not data_source_binding.disabled:
                     data_source_binding.disabled = True
                     data_source_binding.updated_at = naive_utc_now()
                 else:
-                    raise ValueError("Data source is disabled.")
+                    raise BadRequest("Data source is disabled.")
         return {"result": "success"}, 200
 
 

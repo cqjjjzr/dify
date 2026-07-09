@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from unittest.mock import MagicMock, PropertyMock, patch
 from uuid import uuid4
 
@@ -15,7 +14,6 @@ from werkzeug.exceptions import NotFound
 
 from controllers.console.datasets import data_source
 from controllers.console.datasets.data_source import (
-    DataSourceApi,
     DataSourceNotionDatasetSyncApi,
     DataSourceNotionDocumentSyncApi,
     DataSourceNotionIndexingEstimateApi,
@@ -26,6 +24,8 @@ from core.rag.index_processor.constant.index_type import IndexStructureType
 from models import Account, DataSourceOauthBinding
 from models.dataset import Document
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
+from tests.test_containers_integration_tests.controllers.console.helpers import AuthenticatedConsoleClient
+from tests.test_containers_integration_tests.transactional import DatabaseState
 
 
 @pytest.fixture
@@ -47,16 +47,15 @@ def mock_engine() -> Iterator[None]:
 
 
 class TestDataSourceApi:
-    @pytest.fixture
-    def app(self, flask_app_with_containers: Flask) -> Flask:
-        return flask_app_with_containers
-
-    def test_get_success(self, app: Flask) -> None:
-        api = DataSourceApi()
-        method = inspect.unwrap(api.get)
-
+    @staticmethod
+    def create_binding(
+        session: Session,
+        *,
+        tenant_id: str,
+        disabled: bool = False,
+    ) -> DataSourceOauthBinding:
         binding = DataSourceOauthBinding(
-            tenant_id="tenant-1",
+            tenant_id=tenant_id,
             access_token="token",
             provider="notion",
             source_info={
@@ -74,25 +73,35 @@ class TestDataSourceApi:
                     }
                 ],
             },
+            disabled=disabled,
         )
-        binding.id = "b1"
-        binding.created_at = datetime(2026, 5, 25, 1, 2, 3, tzinfo=UTC)
-        binding.disabled = False
+        session.add(binding)
+        session.commit()
+        return binding
 
-        with (
-            app.test_request_context("/"),
-            patch(
-                "controllers.console.datasets.data_source.db.session.scalars",
-                return_value=MagicMock(all=lambda: [binding]),
-            ),
-        ):
-            response, status = method(api, "tenant-1")
+    def test_get_success(
+        self,
+        authenticated_console_client: AuthenticatedConsoleClient,
+        transactional_db_session: Session,
+    ) -> None:
+        binding = self.create_binding(
+            transactional_db_session,
+            tenant_id=authenticated_console_client.tenant.id,
+        )
+        binding_id = binding.id
+        binding_created_at = int(binding.created_at.timestamp())
 
-        assert status == 200
-        assert response["data"][0] == {
-            "id": "b1",
+        response = authenticated_console_client.client.get(
+            "/console/api/data-source/integrates",
+            headers=authenticated_console_client.headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json is not None
+        assert response.json["data"][0] == {
+            "id": binding_id,
             "provider": "notion",
-            "created_at": 1779670923,
+            "created_at": binding_created_at,
             "is_bound": True,
             "disabled": False,
             "source_info": {
@@ -113,83 +122,73 @@ class TestDataSourceApi:
             "link": "http://localhost/console/api/oauth/data-source/notion",
         }
 
-    def test_get_no_bindings(self, app: Flask) -> None:
-        api = DataSourceApi()
-        method = inspect.unwrap(api.get)
+    def test_get_no_bindings(self, authenticated_console_client: AuthenticatedConsoleClient) -> None:
+        response = authenticated_console_client.client.get(
+            "/console/api/data-source/integrates",
+            headers=authenticated_console_client.headers,
+        )
 
-        with (
-            app.test_request_context("/"),
-            patch(
-                "controllers.console.datasets.data_source.db.session.scalars",
-                return_value=MagicMock(all=lambda: []),
-            ),
-        ):
-            response, status = method(api, "tenant-1")
+        assert response.status_code == 200
+        assert response.json == {"data": []}
 
-        assert status == 200
-        assert response["data"] == []
+    @pytest.mark.parametrize(("initially_disabled", "action"), [(True, "enable"), (False, "disable")])
+    def test_patch_binding_persists_state_change(
+        self,
+        initially_disabled: bool,
+        action: str,
+        authenticated_console_client: AuthenticatedConsoleClient,
+        transactional_db_session: Session,
+        database_state: DatabaseState,
+    ) -> None:
+        binding = self.create_binding(
+            transactional_db_session,
+            tenant_id=authenticated_console_client.tenant.id,
+            disabled=initially_disabled,
+        )
+        binding_id = binding.id
 
-    def test_patch_enable_binding(self, app: Flask) -> None:
-        api = DataSourceApi()
-        method = inspect.unwrap(api.patch)
+        response = authenticated_console_client.client.patch(
+            f"/console/api/data-source/integrates/{binding_id}/{action}",
+            headers=authenticated_console_client.headers,
+        )
 
-        binding = MagicMock(id="b1", disabled=True)
-        session = MagicMock()
-        session.scalar.return_value = binding
+        assert response.status_code == 200
+        assert response.json == {"result": "success"}
+        persisted = database_state.one(DataSourceOauthBinding, DataSourceOauthBinding.id == binding_id)
+        assert persisted.disabled is (not initially_disabled)
 
-        with app.test_request_context("/"):
-            response, status = method(api, session, "tenant-1", "b1", "enable")
+    def test_patch_binding_not_found(self, authenticated_console_client: AuthenticatedConsoleClient) -> None:
+        response = authenticated_console_client.client.patch(
+            f"/console/api/data-source/integrates/{uuid4()}/enable",
+            headers=authenticated_console_client.headers,
+        )
 
-        assert status == 200
-        assert binding.disabled is False
+        assert response.status_code == 404
 
-    def test_patch_disable_binding(self, app: Flask) -> None:
-        api = DataSourceApi()
-        method = inspect.unwrap(api.patch)
+    @pytest.mark.parametrize(("disabled", "action"), [(False, "enable"), (True, "disable")])
+    def test_patch_binding_rejects_noop_without_changing_state(
+        self,
+        disabled: bool,
+        action: str,
+        authenticated_console_client: AuthenticatedConsoleClient,
+        transactional_db_session: Session,
+        database_state: DatabaseState,
+    ) -> None:
+        binding = self.create_binding(
+            transactional_db_session,
+            tenant_id=authenticated_console_client.tenant.id,
+            disabled=disabled,
+        )
+        binding_id = binding.id
 
-        binding = MagicMock(id="b1", disabled=False)
-        session = MagicMock()
-        session.scalar.return_value = binding
+        response = authenticated_console_client.client.patch(
+            f"/console/api/data-source/integrates/{binding_id}/{action}",
+            headers=authenticated_console_client.headers,
+        )
 
-        with app.test_request_context("/"):
-            response, status = method(api, session, "tenant-1", "b1", "disable")
-
-        assert status == 200
-        assert binding.disabled is True
-
-    def test_patch_binding_not_found(self, app: Flask) -> None:
-        api = DataSourceApi()
-        method = inspect.unwrap(api.patch)
-        session = MagicMock()
-        session.scalar.return_value = None
-
-        with app.test_request_context("/"):
-            with pytest.raises(NotFound):
-                method(api, session, "tenant-1", "b1", "enable")
-
-    def test_patch_enable_already_enabled(self, app: Flask) -> None:
-        api = DataSourceApi()
-        method = inspect.unwrap(api.patch)
-
-        binding = MagicMock(id="b1", disabled=False)
-        session = MagicMock()
-        session.scalar.return_value = binding
-
-        with app.test_request_context("/"):
-            with pytest.raises(ValueError):
-                method(api, session, "tenant-1", "b1", "enable")
-
-    def test_patch_disable_already_disabled(self, app: Flask) -> None:
-        api = DataSourceApi()
-        method = inspect.unwrap(api.patch)
-
-        binding = MagicMock(id="b1", disabled=True)
-        session = MagicMock()
-        session.scalar.return_value = binding
-
-        with app.test_request_context("/"):
-            with pytest.raises(ValueError):
-                method(api, session, "tenant-1", "b1", "disable")
+        assert response.status_code == 400
+        persisted = database_state.one(DataSourceOauthBinding, DataSourceOauthBinding.id == binding_id)
+        assert persisted.disabled is disabled
 
 
 class TestDataSourceNotionListApi:

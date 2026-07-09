@@ -133,15 +133,15 @@ def _create_message(
 
 
 def test_chat_conversation_status_count_includes_paused(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
-):
-    account, tenant = _create_account_and_tenant(db_session_with_containers)
-    app = _create_app(db_session_with_containers, tenant.id, account.id)
-    conversation = _create_conversation(db_session_with_containers, app.id, account.id)
+) -> None:
+    account, tenant = _create_account_and_tenant(transactional_db_session)
+    app = _create_app(transactional_db_session, tenant.id, account.id)
+    conversation = _create_conversation(transactional_db_session, app.id, account.id)
     conversation_id = conversation.id
-    workflow_run = _create_workflow_run(db_session_with_containers, app.id, tenant.id, account.id)
-    _create_message(db_session_with_containers, app.id, conversation.id, workflow_run.id, account.id)
+    workflow_run = _create_workflow_run(transactional_db_session, app.id, tenant.id, account.id)
+    _create_message(transactional_db_session, app.id, conversation.id, workflow_run.id, account.id)
 
     access_token = AccountService.get_account_jwt_token(account)
     csrf_token = generate_csrf_token(account.id)

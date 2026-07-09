@@ -2,43 +2,32 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
 import pytest
-from flask import Flask
 from flask.testing import FlaskClient
-from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from models import Account
-from models.account import AccountStatus, TenantAccountRole
+from models.account import TenantAccountRole
 from models.enums import ApiTokenType
 from models.model import ApiToken, App, AppMode
 from tests.test_containers_integration_tests.controllers.console.helpers import (
+    ConsoleAccountFactory,
     authenticate_console_client,
     create_console_account_and_tenant,
     create_console_app,
 )
+from tests.test_containers_integration_tests.transactional import DatabaseState
 
 
 @pytest.fixture
 def setup_app(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> tuple[FlaskClient, dict[str, str], App]:
     """Create an authenticated client with an app for API key tests."""
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    app = create_console_app(db_session_with_containers, tenant.id, account.id, AppMode.CHAT)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
     headers = authenticate_console_client(test_client_with_containers, account)
     return test_client_with_containers, headers, app
-
-
-@pytest.fixture(autouse=True)
-def cleanup_api_tokens(db_session_with_containers: Session):
-    """Remove API tokens created during each test."""
-    yield
-    db_session_with_containers.execute(delete(ApiToken))
-    db_session_with_containers.commit()
 
 
 class TestAppApiKeyListResource:
@@ -63,17 +52,17 @@ class TestAppApiKeyListResource:
     def test_create_api_key_persists_authenticated_tenant(
         self,
         setup_app: tuple[FlaskClient, dict[str, str], App],
-        db_session_with_containers: Session,
+        database_state: DatabaseState,
     ) -> None:
         client, headers, app = setup_app
         tenant_id = app.tenant_id
 
-        resp = client.post(f"/console/api/apps/{app.id}/api-keys", headers=headers)
+        with database_state.expect_count_change(ApiToken, ApiToken.app_id == app.id, before=0, after=1):
+            resp = client.post(f"/console/api/apps/{app.id}/api-keys", headers=headers)
+            assert resp.status_code == 201
 
-        assert resp.status_code == 201
         assert resp.json is not None
-        api_token = db_session_with_containers.scalar(select(ApiToken).where(ApiToken.id == resp.json["id"]))
-        assert api_token is not None
+        api_token = database_state.one(ApiToken, ApiToken.id == resp.json["id"])
         assert api_token.tenant_id == tenant_id
         assert api_token.app_id == app.id
         assert api_token.type == ApiTokenType.APP
@@ -91,7 +80,6 @@ class TestAppApiKeyListResource:
     def test_create_key_max_limit(
         self,
         setup_app: tuple[FlaskClient, dict[str, str], App],
-        db_session_with_containers: Session,
     ) -> None:
         client, headers, app = setup_app
         # Create 10 keys (the max)
@@ -116,12 +104,12 @@ class TestAppApiKeyListResource:
     def test_get_foreign_app_keys_not_found(
         self,
         setup_app: tuple[FlaskClient, dict[str, str], App],
-        db_session_with_containers: Session,
+        transactional_db_session: Session,
     ) -> None:
         client, headers, _ = setup_app
-        foreign_account, foreign_tenant = create_console_account_and_tenant(db_session_with_containers)
+        foreign_account, foreign_tenant = create_console_account_and_tenant(transactional_db_session)
         foreign_app = create_console_app(
-            db_session_with_containers, foreign_tenant.id, foreign_account.id, AppMode.CHAT
+            transactional_db_session, foreign_tenant.id, foreign_account.id, AppMode.CHAT
         )
 
         resp = client.get(f"/console/api/apps/{foreign_app.id}/api-keys", headers=headers)
@@ -132,6 +120,7 @@ class TestAppApiKeyListResource:
 class TestAppApiKeyResource:
     """Tests for DELETE /apps/<resource_id>/api-keys/<api_key_id>."""
 
+    @pytest.mark.requires_redis
     def test_delete_key_success(self, setup_app: tuple[FlaskClient, dict[str, str], App]) -> None:
         client, headers, app = setup_app
         create_resp = client.post(f"/console/api/apps/{app.id}/api-keys", headers=headers)
@@ -162,25 +151,28 @@ class TestAppApiKeyResource:
 
     def test_delete_forbidden_for_non_admin(
         self,
-        flask_app_with_containers: Flask,
+        console_account_factory: ConsoleAccountFactory,
+        test_client_with_containers: FlaskClient,
+        transactional_db_session: Session,
+        database_state: DatabaseState,
     ) -> None:
-        """A non-admin member cannot delete API keys via the controller permission check."""
-        from werkzeug.exceptions import Forbidden
+        account, tenant = console_account_factory(role=TenantAccountRole.NORMAL)
+        app = create_console_app(transactional_db_session, tenant.id, account.id, AppMode.CHAT)
+        api_token = ApiToken(
+            app_id=app.id,
+            tenant_id=tenant.id,
+            token=ApiToken.generate_api_key("app-", 24),
+            type=ApiTokenType.APP,
+        )
+        transactional_db_session.add(api_token)
+        transactional_db_session.commit()
+        api_token_id = api_token.id
+        headers = authenticate_console_client(test_client_with_containers, account)
 
-        from controllers.console.apikey import BaseApiKeyResource
+        response = test_client_with_containers.delete(
+            f"/console/api/apps/{app.id}/api-keys/{api_token_id}",
+            headers=headers,
+        )
 
-        resource = BaseApiKeyResource()
-        resource.resource_type = ApiTokenType.APP
-        resource.resource_model = MagicMock()
-        resource.resource_id_field = "app_id"
-
-        non_admin = Account(name="Normal User", email="normal@example.com", status=AccountStatus.ACTIVE)
-        non_admin.id = "normal-user"
-        non_admin.role = TenantAccountRole.NORMAL
-
-        with (
-            flask_app_with_containers.test_request_context("/"),
-            patch("controllers.console.apikey._get_resource"),
-        ):
-            with pytest.raises(Forbidden):
-                BaseApiKeyResource.delete(resource, "rid", "kid", "tenant-id", non_admin)
+        assert response.status_code == 403
+        assert database_state.one(ApiToken, ApiToken.id == api_token_id).id == api_token_id
