@@ -436,6 +436,47 @@ COMMENT ON FUNCTION uuidv7_boundary(timestamptz) IS
     As the smallest possible uuidv7 for that timestamp, it may be used as a boundary for partitions.';
 """
 
+_database_schema_initialized = False
+
+
+def _reload_dify_config() -> None:
+    from configs import dify_config
+
+    dify_config.__dict__.clear()
+    dify_config.__init__()
+
+
+def _initialize_database_schema(app: Flask) -> None:
+    global _database_schema_initialized
+    if _database_schema_initialized:
+        return
+
+    logger.info("Creating database schema...")
+    with app.app_context():
+        with db.engine.connect() as conn, conn.begin():
+            conn.execute(text(_UUIDv7SQL))
+        db.create_all()
+    _database_schema_initialized = True
+    logger.info("Database schema created successfully")
+
+
+def _create_database_app_with_containers() -> Flask:
+    logger.info("Creating database-only Flask application...")
+    _reload_dify_config()
+
+    import models  # noqa: F401
+    from configs import dify_config
+    from dify_app import DifyApp
+    from extensions import ext_database, ext_session_factory
+
+    app = DifyApp("testcontainers-database")
+    app.config.from_mapping(dify_config.model_dump())
+    ext_database.init_app(app)
+    ext_session_factory.init_app(app)
+    _initialize_database_schema(app)
+    logger.info("Database-only Flask application ready")
+    return app
+
 
 def _create_app_with_containers() -> Flask:
     """
@@ -457,12 +498,7 @@ def _create_app_with_containers() -> Flask:
     os.environ["REDIS_USERNAME"] = ""
     os.environ["REDIS_PASSWORD"] = ""
 
-    # Re-create the config after environment variables have been set
-    from configs import dify_config
-
-    # Force re-creation of config with new environment variables
-    dify_config.__dict__.clear()
-    dify_config.__init__()
+    _reload_dify_config()
 
     # Create and configure the Flask application
     logger.info("Initializing Flask application...")
@@ -471,20 +507,7 @@ def _create_app_with_containers() -> Flask:
     sio_app, app = create_app()
     logger.info("Flask application created successfully")
 
-    # Initialize database schema
-    logger.info("Creating database schema...")
-
-    with app.app_context():
-        with db.engine.connect() as conn, conn.begin():
-            conn.execute(text(_UUIDv7SQL))
-        db.create_all()
-        # migration_dir = _get_migration_dir()
-        # alembic_config = Config()
-        # alembic_config.config_file_name = str(migration_dir / "alembic.ini")
-        # alembic_config.set_main_option("sqlalchemy.url", _get_engine_url(db.engine))
-        # alembic_config.set_main_option("script_location", str(migration_dir))
-        # alembic_command.upgrade(revision="head", config=alembic_config)
-    logger.info("Database schema created successfully")
+    _initialize_database_schema(app)
 
     logger.info("Flask application configured and ready for testing")
     return app
@@ -502,6 +525,8 @@ def set_up_containers_and_env(request: pytest.FixtureRequest) -> Generator[DifyT
     Yields:
         DifyTestContainers: Container manager instance
     """
+    global _database_schema_initialized
+    _database_schema_initialized = False
     logger.info("=== Starting test session container management ===")
     services = _parse_requested_services(request.config.getoption("tc_services"), request.session.items)
     _container_manager.start_containers_with_env(services)
@@ -509,7 +534,14 @@ def set_up_containers_and_env(request: pytest.FixtureRequest) -> Generator[DifyT
     yield _container_manager
     logger.info("=== Cleaning up test session containers ===")
     _container_manager.stop_containers()
+    _database_schema_initialized = False
     logger.info("Test session container cleanup completed")
+
+
+@pytest.fixture(scope="session")
+def database_app_with_containers(set_up_containers_and_env: DifyTestContainers) -> Flask:
+    assert set_up_containers_and_env is _container_manager
+    return _create_database_app_with_containers()
 
 
 @pytest.fixture(scope="session")
@@ -602,6 +634,16 @@ def db_session_with_containers(flask_app_with_containers: Flask) -> Generator[Se
 
 
 @pytest.fixture
+def database_session_with_containers(database_app_with_containers: Flask) -> Generator[Session, None, None]:
+    with database_app_with_containers.app_context():
+        session = db.session()
+        try:
+            yield session
+        finally:
+            session.close()
+
+
+@pytest.fixture
 def transactional_db_session(
     request: pytest.FixtureRequest,
     flask_app_with_containers: Flask,
@@ -668,15 +710,23 @@ def isolate_container_database(request: pytest.FixtureRequest) -> Generator[None
     """
     yield
 
-    if "flask_app_with_containers" not in request.fixturenames:
+    app_fixture_name = next(
+        (
+            fixture_name
+            for fixture_name in ("flask_app_with_containers", "database_app_with_containers")
+            if fixture_name in request.fixturenames
+        ),
+        None,
+    )
+    if app_fixture_name is None:
         return
 
-    app = request.getfixturevalue("flask_app_with_containers")
+    app = request.getfixturevalue(app_fixture_name)
     assert isinstance(app, Flask)
     skip_truncate = request.node.get_closest_marker("no_container_truncate") is not None
     if not skip_truncate:
         _truncate_container_database(app)
-    if "redis" in _container_manager.started_services:
+    if "redis" in _container_manager.started_services and "redis" in app.extensions:
         _flush_container_redis(app)
 
 
