@@ -4,7 +4,6 @@ import json
 from unittest.mock import ANY, patch
 
 from flask.testing import FlaskClient
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models.source import DataSourceApiKeyAuthBinding
@@ -12,14 +11,15 @@ from tests.test_containers_integration_tests.controllers.console.helpers import 
     authenticate_console_client,
     create_console_account_and_tenant,
 )
+from tests.test_containers_integration_tests.transactional import DatabaseState
 
 
 def test_get_api_key_auth_data_source(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
-    foreign_account, foreign_tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
+    foreign_account, foreign_tenant = create_console_account_and_tenant(transactional_db_session)
     binding = DataSourceApiKeyAuthBinding(
         tenant_id=tenant.id,
         category="api_key",
@@ -34,8 +34,8 @@ def test_get_api_key_auth_data_source(
         credentials=json.dumps({"auth_type": "api_key", "config": {"api_key": "encrypted"}}),
         disabled=False,
     )
-    db_session_with_containers.add_all([binding, foreign_binding])
-    db_session_with_containers.commit()
+    transactional_db_session.add_all([binding, foreign_binding])
+    transactional_db_session.commit()
     authenticate_console_client(test_client_with_containers, foreign_account)
 
     response = test_client_with_containers.get(
@@ -51,10 +51,10 @@ def test_get_api_key_auth_data_source(
 
 
 def test_get_api_key_auth_data_source_empty(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, _tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, _tenant = create_console_account_and_tenant(transactional_db_session)
 
     response = test_client_with_containers.get(
         "/console/api/api-key-auth/data-source",
@@ -66,10 +66,10 @@ def test_get_api_key_auth_data_source_empty(
 
 
 def test_create_binding_successful(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
     tenant_id = tenant.id
     payload = {"category": "api_key", "provider": "custom", "credentials": {"key": "value"}}
 
@@ -89,10 +89,10 @@ def test_create_binding_successful(
 
 
 def test_create_binding_failure(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, _tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, _tenant = create_console_account_and_tenant(transactional_db_session)
 
     with (
         patch("controllers.console.auth.data_source_bearer_auth.ApiKeyAuthService.validate_api_key_auth_args"),
@@ -115,10 +115,11 @@ def test_create_binding_failure(
 
 
 def test_delete_binding_successful(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
+    database_state: DatabaseState,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
     binding = DataSourceApiKeyAuthBinding(
         tenant_id=tenant.id,
         category="api_key",
@@ -126,8 +127,8 @@ def test_delete_binding_successful(
         credentials=json.dumps({"auth_type": "api_key", "config": {"api_key": "encrypted"}}),
         disabled=False,
     )
-    db_session_with_containers.add(binding)
-    db_session_with_containers.commit()
+    transactional_db_session.add(binding)
+    transactional_db_session.commit()
 
     response = test_client_with_containers.delete(
         f"/console/api/api-key-auth/data-source/{binding.id}",
@@ -136,19 +137,17 @@ def test_delete_binding_successful(
 
     assert response.status_code == 204
     assert (
-        db_session_with_containers.scalar(
-            select(DataSourceApiKeyAuthBinding).where(DataSourceApiKeyAuthBinding.id == binding.id)
-        )
-        is None
+        database_state.count(DataSourceApiKeyAuthBinding, DataSourceApiKeyAuthBinding.id == binding.id) == 0
     )
 
 
 def test_delete_binding_scopes_to_authenticated_tenant(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
+    database_state: DatabaseState,
 ) -> None:
-    account, _tenant = create_console_account_and_tenant(db_session_with_containers)
-    foreign_account, foreign_tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, _tenant = create_console_account_and_tenant(transactional_db_session)
+    foreign_account, foreign_tenant = create_console_account_and_tenant(transactional_db_session)
     foreign_binding = DataSourceApiKeyAuthBinding(
         tenant_id=foreign_tenant.id,
         category="api_key",
@@ -156,8 +155,8 @@ def test_delete_binding_scopes_to_authenticated_tenant(
         credentials=json.dumps({"auth_type": "api_key", "config": {"api_key": "encrypted"}}),
         disabled=False,
     )
-    db_session_with_containers.add(foreign_binding)
-    db_session_with_containers.commit()
+    transactional_db_session.add(foreign_binding)
+    transactional_db_session.commit()
     foreign_binding_id = foreign_binding.id
     authenticate_console_client(test_client_with_containers, foreign_account)
 
@@ -168,8 +167,6 @@ def test_delete_binding_scopes_to_authenticated_tenant(
 
     assert response.status_code == 204
     assert (
-        db_session_with_containers.scalar(
-            select(DataSourceApiKeyAuthBinding).where(DataSourceApiKeyAuthBinding.id == foreign_binding_id)
-        )
-        is not None
+        database_state.one(DataSourceApiKeyAuthBinding, DataSourceApiKeyAuthBinding.id == foreign_binding_id).id
+        == foreign_binding_id
     )

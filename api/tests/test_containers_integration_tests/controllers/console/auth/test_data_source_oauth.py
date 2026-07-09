@@ -13,10 +13,10 @@ from tests.test_containers_integration_tests.controllers.console.helpers import 
 
 
 def test_get_oauth_url_successful(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
     tenant_id = tenant.id
     current_tenant_id = account.current_tenant_id
     provider = MagicMock()
@@ -38,10 +38,10 @@ def test_get_oauth_url_successful(
 
 
 def test_get_oauth_url_invalid_provider(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, _tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, _tenant = create_console_account_and_tenant(transactional_db_session)
 
     with patch("controllers.console.auth.data_source_oauth.get_oauth_providers", return_value={"notion": MagicMock()}):
         response = test_client_with_containers.get(
@@ -96,10 +96,10 @@ def test_get_binding_missing_code(test_client_with_containers: FlaskClient) -> N
 
 
 def test_sync_successful(
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
     test_client_with_containers: FlaskClient,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
     binding = DataSourceOauthBinding(
         tenant_id=tenant.id,
         access_token="test-access-token",
@@ -107,8 +107,8 @@ def test_sync_successful(
         source_info={"workspace_name": "Workspace", "workspace_icon": None, "workspace_id": tenant.id, "pages": []},
         disabled=False,
     )
-    db_session_with_containers.add(binding)
-    db_session_with_containers.commit()
+    transactional_db_session.add(binding)
+    transactional_db_session.commit()
 
     provider = MagicMock()
     with patch("controllers.console.auth.data_source_oauth.get_oauth_providers", return_value={"notion": provider}):

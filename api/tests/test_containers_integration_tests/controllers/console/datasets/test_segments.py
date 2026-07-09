@@ -18,9 +18,9 @@ from tests.test_containers_integration_tests.controllers.console.helpers import 
 
 def test_list_segments_uses_real_db_query_and_console_response_shape(
     test_client_with_containers: FlaskClient,
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
 ) -> None:
-    account, tenant = create_console_account_and_tenant(db_session_with_containers)
+    account, tenant = create_console_account_and_tenant(transactional_db_session)
     dataset = Dataset(
         tenant_id=tenant.id,
         name=f"Console Segment Dataset {uuid4()}",
@@ -31,8 +31,8 @@ def test_list_segments_uses_real_db_query_and_console_response_shape(
         permission="only_me",
         provider="vendor",
     )
-    db_session_with_containers.add(dataset)
-    db_session_with_containers.commit()
+    transactional_db_session.add(dataset)
+    transactional_db_session.commit()
 
     document = Document(
         tenant_id=tenant.id,
@@ -50,8 +50,8 @@ def test_list_segments_uses_real_db_query_and_console_response_shape(
         word_count=3,
         tokens=4,
     )
-    db_session_with_containers.add(document)
-    db_session_with_containers.commit()
+    transactional_db_session.add(document)
+    transactional_db_session.commit()
 
     segment = DocumentSegment(
         tenant_id=tenant.id,
@@ -65,11 +65,11 @@ def test_list_segments_uses_real_db_query_and_console_response_shape(
         status=SegmentStatus.COMPLETED,
         created_by=account.id,
     )
-    db_session_with_containers.add(segment)
-    db_session_with_containers.commit()
+    transactional_db_session.add(segment)
+    transactional_db_session.commit()
     segment_id = segment.id
 
-    db_session_with_containers.add(
+    transactional_db_session.add(
         DocumentSegmentSummary(
             dataset_id=dataset.id,
             document_id=document.id,
@@ -78,7 +78,7 @@ def test_list_segments_uses_real_db_query_and_console_response_shape(
             status=SummaryStatus.COMPLETED,
         )
     )
-    db_session_with_containers.commit()
+    transactional_db_session.commit()
 
     response = test_client_with_containers.get(
         f"/console/api/datasets/{dataset.id}/documents/{document.id}/segments"
