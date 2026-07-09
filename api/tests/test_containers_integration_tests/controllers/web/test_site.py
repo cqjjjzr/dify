@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from types import ModuleType
+from unittest.mock import patch
 
 import pytest
 from flask import Flask
 from sqlalchemy.orm import Session
 from werkzeug.exceptions import Forbidden
 
-from controllers.web.site import AppSiteApi, WebAppSiteResponse, WebModelConfigResponse
 from models import Tenant, TenantStatus
 from models.account import TenantCustomConfigDict
 from models.model import App, AppMode, AppModelConfig, CustomizeTokenStrategy, EndUser, Site
@@ -19,6 +19,14 @@ from services.feature_service import FeatureModel
 @pytest.fixture
 def app(flask_app_with_containers: Flask) -> Flask:
     return flask_app_with_containers
+
+
+@pytest.fixture
+def site_module(app: Flask) -> ModuleType:
+    del app
+    from controllers.web import site
+
+    return site
 
 
 def _create_tenant(db_session: Session, *, status: TenantStatus = TenantStatus.NORMAL) -> Tenant:
@@ -79,24 +87,29 @@ def _site_model(*, app_id: str) -> Site:
 
 
 class TestAppSiteApi:
-    @patch("controllers.web.site.FeatureService.get_features")
-    def test_happy_path(self, mock_features: MagicMock, app: Flask, db_session_with_containers: Session) -> None:
+    def test_happy_path(
+        self, app: Flask, site_module: ModuleType, db_session_with_containers: Session
+    ) -> None:
         app.config["RESTX_MASK_HEADER"] = "X-Fields"
         tenant = _create_tenant(db_session_with_containers)
         app_model = _create_app(db_session_with_containers, tenant.id)
         _create_site(db_session_with_containers, app_model.id)
         end_user = _end_user(tenant.id, app_model.id)
-        mock_features.return_value = FeatureModel(can_replace_logo=False)
 
-        with app.test_request_context("/site"):
-            result = AppSiteApi().get(app_model, end_user)
+        with (
+            patch.object(site_module.FeatureService, "get_features", return_value=FeatureModel(can_replace_logo=False)),
+            app.test_request_context("/site"),
+        ):
+            result = site_module.AppSiteApi().get(app_model, end_user)
 
         assert result["app_id"] == app_model.id
         assert result["end_user_id"] == end_user.id
         assert result["plan"] == "basic"
         assert result["enable_site"] is True
 
-    def test_missing_site_raises_forbidden(self, app: Flask, db_session_with_containers: Session) -> None:
+    def test_missing_site_raises_forbidden(
+        self, app: Flask, site_module: ModuleType, db_session_with_containers: Session
+    ) -> None:
         app.config["RESTX_MASK_HEADER"] = "X-Fields"
         tenant = _create_tenant(db_session_with_containers)
         app_model = _create_app(db_session_with_containers, tenant.id)
@@ -104,9 +117,11 @@ class TestAppSiteApi:
 
         with app.test_request_context("/site"):
             with pytest.raises(Forbidden):
-                AppSiteApi().get(app_model, end_user)
+                site_module.AppSiteApi().get(app_model, end_user)
 
-    def test_archived_tenant_raises_forbidden(self, app: Flask, db_session_with_containers: Session) -> None:
+    def test_archived_tenant_raises_forbidden(
+        self, app: Flask, site_module: ModuleType, db_session_with_containers: Session
+    ) -> None:
         app.config["RESTX_MASK_HEADER"] = "X-Fields"
         tenant = _create_tenant(db_session_with_containers, status=TenantStatus.ARCHIVE)
         app_model = _create_app(db_session_with_containers, tenant.id)
@@ -115,7 +130,7 @@ class TestAppSiteApi:
 
         with app.test_request_context("/site"):
             with pytest.raises(Forbidden):
-                AppSiteApi().get(app_model, end_user)
+                site_module.AppSiteApi().get(app_model, end_user)
 
 
 def _tenant_model(*, plan: str = "basic", custom_config: TenantCustomConfigDict | None = None) -> Tenant:
@@ -137,10 +152,10 @@ def _app_model(*, tenant: Tenant, enable_site: bool = True) -> App:
 
 
 class TestWebAppSiteResponse:
-    def test_basic_fields(self) -> None:
+    def test_basic_fields(self, site_module: ModuleType) -> None:
         tenant = _tenant_model()
         app_model = _app_model(tenant=tenant)
-        response = WebAppSiteResponse.from_app_site(
+        response = site_module.WebAppSiteResponse.from_app_site(
             tenant=tenant,
             app_model=app_model,
             site=_site_model(app_id=app_model.id),
@@ -159,7 +174,7 @@ class TestWebAppSiteResponse:
         assert response.site.input_placeholder == "Ask the app"
         assert response.site.custom_disclaimer == ""
 
-    def test_nullable_site_fields_preserve_none(self) -> None:
+    def test_nullable_site_fields_preserve_none(self, site_module: ModuleType) -> None:
         tenant = _tenant_model()
         app_model = _app_model(tenant=tenant)
         site = _site_model(app_id=app_model.id)
@@ -171,7 +186,7 @@ class TestWebAppSiteResponse:
         site.copyright = None
         site.privacy_policy = None
 
-        response = WebAppSiteResponse.from_app_site(
+        response = site_module.WebAppSiteResponse.from_app_site(
             tenant=tenant,
             app_model=app_model,
             site=site,
@@ -191,21 +206,21 @@ class TestWebAppSiteResponse:
         assert dumped["site"]["privacy_policy"] is None
         assert dumped["site"]["custom_disclaimer"] == ""
 
-    @patch("controllers.web.site.dify_config.FILES_URL", "https://files.example.com")
-    def test_can_replace_logo_sets_custom_config(self) -> None:
+    def test_can_replace_logo_sets_custom_config(self, site_module: ModuleType) -> None:
         tenant = _tenant_model(
             plan="pro",
             custom_config={"remove_webapp_brand": True, "replace_webapp_logo": "enabled"},
         )
         app_model = _app_model(tenant=tenant)
-        response = WebAppSiteResponse.from_app_site(
-            tenant=tenant,
-            app_model=app_model,
-            site=_site_model(app_id=app_model.id),
-            end_user_id="eu-1",
-            features=FeatureModel(can_replace_logo=True, webapp_copyright_enabled=True),
-            can_replace_logo=True,
-        )
+        with patch.object(site_module.dify_config, "FILES_URL", "https://files.example.com"):
+            response = site_module.WebAppSiteResponse.from_app_site(
+                tenant=tenant,
+                app_model=app_model,
+                site=_site_model(app_id=app_model.id),
+                end_user_id="eu-1",
+                features=FeatureModel(can_replace_logo=True, webapp_copyright_enabled=True),
+                can_replace_logo=True,
+            )
 
         assert response.can_replace_logo is True
         assert response.custom_config is not None
@@ -215,7 +230,7 @@ class TestWebAppSiteResponse:
 
 
 class TestWebModelConfigResponse:
-    def test_serializes_internal_model_config_properties_to_public_keys(self) -> None:
+    def test_serializes_internal_model_config_properties_to_public_keys(self, site_module: ModuleType) -> None:
         model_config = AppModelConfig(
             app_id="app-test",
             opening_statement="Hello",
@@ -229,7 +244,9 @@ class TestWebModelConfigResponse:
             updated_by="account-1",
         )
 
-        dumped = WebModelConfigResponse.model_validate(model_config, from_attributes=True).model_dump(mode="json")
+        dumped = site_module.WebModelConfigResponse.model_validate(model_config, from_attributes=True).model_dump(
+            mode="json"
+        )
 
         assert dumped == {
             "opening_statement": "Hello",
