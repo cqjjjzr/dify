@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
 from flask.testing import FlaskClient
 from sqlalchemy.orm import Session
 
@@ -20,6 +21,8 @@ from models.enums import (
 )
 from models.model import ApiToken
 from tests.test_containers_integration_tests.controllers.console.helpers import create_console_account_and_tenant
+
+pytestmark = pytest.mark.requires_redis
 
 
 def _create_dataset_graph(db_session: Session) -> tuple[Dataset, Document, DocumentSegment]:
@@ -98,15 +101,15 @@ def _auth_headers(db_session: Session, dataset: Dataset) -> dict[str, str]:
 
 def test_list_segments_uses_real_services_and_service_api_shape(
     test_client_with_containers: FlaskClient,
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
 ) -> None:
-    dataset, document, segment = _create_dataset_graph(db_session_with_containers)
+    dataset, document, segment = _create_dataset_graph(transactional_db_session)
     segment_id = segment.id
 
     response = test_client_with_containers.get(
         f"/v1/datasets/{dataset.id}/documents/{document.id}/segments"
         "?page=1&limit=20&status=completed&keyword=integration",
-        headers=_auth_headers(db_session_with_containers, dataset),
+        headers=_auth_headers(transactional_db_session, dataset),
     )
 
     assert response.status_code == 200
@@ -123,9 +126,9 @@ def test_list_segments_uses_real_services_and_service_api_shape(
 
 def test_list_child_chunks_uses_real_segment_service(
     test_client_with_containers: FlaskClient,
-    db_session_with_containers: Session,
+    transactional_db_session: Session,
 ) -> None:
-    dataset, document, segment = _create_dataset_graph(db_session_with_containers)
+    dataset, document, segment = _create_dataset_graph(transactional_db_session)
     child_chunk = ChildChunk(
         tenant_id=dataset.tenant_id,
         dataset_id=dataset.id,
@@ -137,13 +140,13 @@ def test_list_child_chunks_uses_real_segment_service(
         type=SegmentType.CUSTOMIZED,
         created_by=document.created_by,
     )
-    db_session_with_containers.add(child_chunk)
-    db_session_with_containers.commit()
+    transactional_db_session.add(child_chunk)
+    transactional_db_session.commit()
 
     response = test_client_with_containers.get(
         f"/v1/datasets/{dataset.id}/documents/{document.id}/segments/{segment.id}/child_chunks"
         "?page=1&limit=20&keyword=integration",
-        headers=_auth_headers(db_session_with_containers, dataset),
+        headers=_auth_headers(transactional_db_session, dataset),
     )
 
     assert response.status_code == 200
