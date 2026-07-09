@@ -108,7 +108,7 @@ test:
 		uv run --project api --dev pytest $(TARGET_TESTS); \
 	else \
 		echo "Running backend unit tests"; \
-		uv run --project api --dev pytest -p no:benchmark --timeout "$${PYTEST_TIMEOUT:-20}" -n auto \
+		uv run --project api --dev pytest -p no:benchmark --timeout "$${PYTEST_TIMEOUT:-20}" \
 			api/tests/unit_tests \
 			api/providers/vdb/*/tests/unit_tests \
 			api/providers/trace/*/tests/unit_tests \
@@ -125,7 +125,7 @@ test-all:
 		uv run --project api --dev pytest $(TARGET_TESTS); \
 	else \
 		echo "Running backend unit tests"; \
-		uv run --project api --dev pytest -p no:benchmark --timeout "$${PYTEST_TIMEOUT:-20}" -n auto \
+		uv run --project api --dev pytest -p no:benchmark --timeout "$${PYTEST_TIMEOUT:-20}" \
 			api/tests/unit_tests \
 			api/providers/vdb/*/tests/unit_tests \
 			api/providers/trace/*/tests/unit_tests \
@@ -133,11 +133,15 @@ test-all:
 		uv run --project api --dev pytest --timeout "$${PYTEST_TIMEOUT:-20}" --cov-append \
 			api/tests/unit_tests/controllers; \
 		echo "Running backend integration tests"; \
-		uv run --project api --dev pytest -p no:benchmark --start-middleware -n auto \
+		uv run --project api --dev pytest -p no:benchmark --start-middleware \
 			--timeout "$${PYTEST_TIMEOUT:-180}" \
 			--cov-append \
 			api/tests/integration_tests/workflow \
-			api/tests/integration_tests/tools \
+			api/tests/integration_tests/tools; \
+		echo "Running testcontainers integration tests"; \
+		uv run --project api --dev pytest -p no:benchmark \
+			--timeout "$${PYTEST_TIMEOUT:-180}" \
+			--cov-append \
 			api/tests/test_containers_integration_tests; \
 		echo "Running VDB smoke tests"; \
 		uv run --project api --dev pytest --start-vdb \

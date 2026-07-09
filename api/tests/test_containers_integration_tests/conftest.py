@@ -28,6 +28,7 @@ from testcontainers.redis import RedisContainer
 
 from app_factory import create_app
 from extensions.ext_database import db
+from tests.test_containers_integration_tests.transactional import DatabaseState, bind_test_transaction
 
 # Configure logging for test containers
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -36,6 +37,21 @@ _TEST_SANDBOX_IMAGE = os.getenv("TEST_SANDBOX_IMAGE", "langgenius/dify-sandbox:0
 
 DEFAULT_SANDBOX_TEST_IMAGE = "langgenius/dify-sandbox:0.2.14"
 SANDBOX_TEST_IMAGE_ENV = "DIFY_SANDBOX_TEST_IMAGE"
+_ALL_CONTAINER_SERVICES = frozenset({"postgres", "redis", "sandbox", "plugin-daemon"})
+_SERVICE_MARKERS = {
+    "requires_redis": "redis",
+    "requires_sandbox": "sandbox",
+    "requires_plugin_daemon": "plugin-daemon",
+}
+_AUTO_PATH_REQUIREMENTS = {
+    "/workflow/nodes/code_executor/": frozenset({"sandbox"}),
+}
+_REDIS_SOURCE_IMPORTS = (
+    "from extensions.ext_redis import redis_client",
+    "from extensions.ext_redis import redis_client,",
+    'app.extensions["redis"]',
+    "app.extensions['redis']",
+)
 
 
 class _CloserProtocol(Protocol):
@@ -58,6 +74,68 @@ def _wait_for_log_message(message: str, timeout: int) -> LogMessageWaitStrategy:
     return LogMessageWaitStrategy(message).with_startup_timeout(timeout)
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("dify-testcontainers")
+    group.addoption(
+        "--tc-services",
+        default=os.getenv("DIFY_TESTCONTAINERS_SERVICES", "auto"),
+        help="Testcontainer services: auto, all, or a comma-separated postgres/redis/sandbox/plugin-daemon list.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "requires_redis: start a real Redis testcontainer")
+    config.addinivalue_line("markers", "requires_sandbox: start a real code-execution Sandbox testcontainer")
+    config.addinivalue_line("markers", "requires_plugin_daemon: start a real Plugin Daemon testcontainer")
+    config.addinivalue_line(
+        "markers",
+        "no_container_truncate: skip the legacy post-test TRUNCATE reset when another isolation strategy owns cleanup",
+    )
+    if getattr(config.option, "numprocesses", None):
+        raise pytest.UsageError(
+            "xdist is disabled for testcontainers integration tests because each worker creates a full container stack"
+        )
+
+
+def _parse_requested_services(value: str, items: list[pytest.Item]) -> frozenset[str]:
+    normalized = value.strip().lower()
+    if normalized == "all":
+        return _ALL_CONTAINER_SERVICES
+    if normalized != "auto":
+        requested = frozenset(service.strip() for service in normalized.split(",") if service.strip())
+        unknown_services = requested - _ALL_CONTAINER_SERVICES
+        if unknown_services:
+            raise pytest.UsageError(f"Unknown --tc-services values: {', '.join(sorted(unknown_services))}")
+        return requested | {"postgres"}
+
+    requested_services = {"postgres"}
+    redis_source_paths: dict[Path, bool] = {}
+    for item in items:
+        for marker_name, service in _SERVICE_MARKERS.items():
+            if item.get_closest_marker(marker_name) is not None:
+                requested_services.add(service)
+
+        normalized_node_id = item.nodeid.replace("\\", "/")
+        for path_fragment, services in _AUTO_PATH_REQUIREMENTS.items():
+            if path_fragment in normalized_node_id:
+                requested_services.update(services)
+
+        source_path = Path(str(item.path))
+        if source_path not in redis_source_paths:
+            try:
+                source = source_path.read_text(encoding="utf-8")
+            except OSError:
+                redis_source_paths[source_path] = False
+            else:
+                redis_source_paths[source_path] = any(token in source for token in _REDIS_SOURCE_IMPORTS)
+        if redis_source_paths[source_path]:
+            requested_services.add("redis")
+
+    if "plugin-daemon" in requested_services:
+        requested_services.add("redis")
+    return frozenset(requested_services)
+
+
 class DifyTestContainers:
     """
     Manages all test containers required for Dify integration tests.
@@ -74,35 +152,28 @@ class DifyTestContainers:
         self.redis: RedisContainer | None = None
         self.dify_sandbox: DockerContainer | None = None
         self.dify_plugin_daemon: DockerContainer | None = None
-        self._containers_started = False
+        self._started_services: set[str] = set()
         logger.info("DifyTestContainers initialized - ready to manage test containers")
 
-    def start_containers_with_env(self) -> None:
-        """
-        Start all required containers for integration testing.
+    @property
+    def started_services(self) -> frozenset[str]:
+        return frozenset(self._started_services)
 
-        This method initializes and starts PostgreSQL, Redis
-        containers with appropriate configurations for Dify testing. Containers
-        are started in dependency order to ensure proper initialization.
-        """
-        if self._containers_started:
-            logger.info("Containers already started - skipping container startup")
+    def _ensure_network(self) -> Network:
+        if self.network is None:
+            logger.info("Creating Docker network for container communication...")
+            self.network = Network()
+            self.network.create()
+            logger.info("Docker network created successfully with name: %s", self.network.name)
+        return self.network
+
+    def _start_postgres(self, *, create_plugin_database: bool) -> None:
+        if self.postgres is not None:
             return
 
-        logger.info("Starting test containers for Dify integration tests...")
-
-        # Create Docker network for container communication
-        logger.info("Creating Docker network for container communication...")
-        self.network = Network()
-        self.network.create()
-        logger.info("Docker network created successfully with name: %s", self.network.name)
-
-        # Start PostgreSQL container for main application database
-        # PostgreSQL is used for storing user data, workflows, and application state
+        network = self._ensure_network()
         logger.info("Initializing PostgreSQL container...")
-        self.postgres = PostgresContainer(
-            image="postgres:14-alpine",
-        ).with_network(self.network)
+        self.postgres = PostgresContainer(image="postgres:14-alpine").with_network(network)
         self.postgres.waiting_for(_wait_for_log_message("is ready to accept connections", 30))
         self.postgres.start()
         db_host = self.postgres.get_container_host_ip()
@@ -120,8 +191,6 @@ class DifyTestContainers:
             self.postgres.dbname,
         )
 
-        logger.info("PostgreSQL container is ready and accepting connections")
-
         conn = psycopg2.connect(
             host=db_host,
             port=db_port,
@@ -132,53 +201,50 @@ class DifyTestContainers:
         conn.autocommit = True
         with _auto_close(conn):
             with conn.cursor() as cursor:
-                # Install uuid-ossp extension for UUID generation
-                logger.info("Installing uuid-ossp extension...")
                 cursor.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
-            logger.info("uuid-ossp extension installed successfully")
 
-            # NOTE: We cannot use `with conn.cursor() as cursor:` as it will wrap the statement
-            # inside a transaction. However, the `CREATE DATABASE` statement cannot run inside a transaction block.
-            with _auto_close(conn.cursor()) as cursor:
-                # Create plugin database for dify-plugin-daemon
-                logger.info("Creating plugin database...")
-                cursor.execute("CREATE DATABASE dify_plugin;")
-            logger.info("Plugin database created successfully")
+            if create_plugin_database:
+                with _auto_close(conn.cursor()) as cursor:
+                    cursor.execute("CREATE DATABASE dify_plugin;")
 
-        # Set up storage environment variables
         os.environ.setdefault("STORAGE_TYPE", "opendal")
         os.environ.setdefault("OPENDAL_SCHEME", "fs")
         os.environ.setdefault("OPENDAL_FS_ROOT", "/tmp/dify-storage")
+        self._started_services.add("postgres")
 
-        # Start Redis container for caching and session management
-        # Redis is used for storing session data, cache entries, and temporary data
+    def _start_redis(self) -> None:
+        if self.redis is not None:
+            return
+
+        network = self._ensure_network()
         logger.info("Initializing Redis container...")
-        self.redis = RedisContainer(image="redis:6-alpine", port=6379).with_network(self.network)
+        self.redis = RedisContainer(image="redis:6-alpine", port=6379).with_network(network)
         self.redis.waiting_for(_wait_for_log_message("Ready to accept connections", 30))
         self.redis.start()
         redis_host = self.redis.get_container_host_ip()
         redis_port = self.redis.get_exposed_port(6379)
         os.environ["REDIS_HOST"] = redis_host
         os.environ["REDIS_PORT"] = str(redis_port)
+        self._started_services.add("redis")
         logger.info("Redis container started successfully - Host: %s, Port: %s", redis_host, redis_port)
 
-        logger.info("Redis container is ready and accepting connections")
+    def _start_sandbox(self) -> None:
+        if self.dify_sandbox is not None:
+            return
 
-        # Start Dify Sandbox container for code execution environment.
-        # Default to the production-pinned image while allowing local overrides for debugging.
-        logger.info("Initializing Dify Sandbox container...")
+        network = self._ensure_network()
         sandbox_image = os.getenv(SANDBOX_TEST_IMAGE_ENV, DEFAULT_SANDBOX_TEST_IMAGE)
-        self.dify_sandbox = DockerContainer(image=sandbox_image).with_network(self.network)
+        logger.info("Initializing Dify Sandbox container...")
+        self.dify_sandbox = DockerContainer(image=sandbox_image).with_network(network)
         self.dify_sandbox.with_exposed_ports(8194)
         self.dify_sandbox.waiting_for(_wait_for_log_message("config init success", 60))
-        self.dify_sandbox.env = {
-            "API_KEY": "test_api_key",
-        }
+        self.dify_sandbox.env = {"API_KEY": "test_api_key"}
         self.dify_sandbox.start()
         sandbox_host = self.dify_sandbox.get_container_host_ip()
         sandbox_port = self.dify_sandbox.get_exposed_port(8194)
         os.environ["CODE_EXECUTION_ENDPOINT"] = f"http://{sandbox_host}:{sandbox_port}"
         os.environ["CODE_EXECUTION_API_KEY"] = "test_api_key"
+        self._started_services.add("sandbox")
         logger.info(
             "Dify Sandbox container started successfully - Image: %s Host: %s, Port: %s",
             sandbox_image,
@@ -186,30 +252,31 @@ class DifyTestContainers:
             sandbox_port,
         )
 
-        logger.info("Dify Sandbox container is ready and accepting connections")
+    def _start_plugin_daemon(self) -> None:
+        if self.dify_plugin_daemon is not None:
+            return
 
-        # Start Dify Plugin Daemon container for plugin management
-        # Dify Plugin Daemon provides plugin lifecycle management and execution
+        assert self.postgres is not None
+        assert self.redis is not None
+        network = self._ensure_network()
         logger.info("Initializing Dify Plugin Daemon container...")
         self.dify_plugin_daemon = DockerContainer(image="langgenius/dify-plugin-daemon:0.5.3-local").with_network(
-            self.network
+            network
         )
         self.dify_plugin_daemon.with_exposed_ports(5002)
         self.dify_plugin_daemon.waiting_for(_wait_for_log_message("start plugin manager daemon", 60))
-        # Get container internal network addresses
         postgres_container_name = self.postgres.get_wrapped_container().name
         redis_container_name = self.redis.get_wrapped_container().name
         assert postgres_container_name is not None
         assert redis_container_name is not None
-
         self.dify_plugin_daemon.env = {
-            "DB_HOST": postgres_container_name,  # Use container name for internal network communication
-            "DB_PORT": "5432",  # Use internal port
+            "DB_HOST": postgres_container_name,
+            "DB_PORT": "5432",
             "DB_USERNAME": self.postgres.username,
             "DB_PASSWORD": self.postgres.password,
             "DB_DATABASE": "dify_plugin",
-            "REDIS_HOST": redis_container_name,  # Use container name for internal network communication
-            "REDIS_PORT": "6379",  # Use internal port
+            "REDIS_HOST": redis_container_name,
+            "REDIS_PORT": "6379",
             "REDIS_PASSWORD": "",
             "SERVER_PORT": "5002",
             "SERVER_KEY": "test_plugin_daemon_key",
@@ -231,27 +298,55 @@ class DifyTestContainers:
             "PLUGIN_PACKAGE_CACHE_PATH": "plugin_packages",
             "PLUGIN_MEDIA_CACHE_PATH": "assets",
         }
+        self.dify_plugin_daemon.start()
+        plugin_daemon_host = self.dify_plugin_daemon.get_container_host_ip()
+        plugin_daemon_port = self.dify_plugin_daemon.get_exposed_port(5002)
+        os.environ["PLUGIN_DAEMON_URL"] = f"http://{plugin_daemon_host}:{plugin_daemon_port}"
+        os.environ["PLUGIN_DAEMON_KEY"] = "test_plugin_daemon_key"
+        self._started_services.add("plugin-daemon")
+        logger.info(
+            "Dify Plugin Daemon container started successfully - Host: %s, Port: %s",
+            plugin_daemon_host,
+            plugin_daemon_port,
+        )
 
-        try:
-            self.dify_plugin_daemon.start()
-            plugin_daemon_host = self.dify_plugin_daemon.get_container_host_ip()
-            plugin_daemon_port = self.dify_plugin_daemon.get_exposed_port(5002)
-            os.environ["PLUGIN_DAEMON_URL"] = f"http://{plugin_daemon_host}:{plugin_daemon_port}"
-            os.environ["PLUGIN_DAEMON_KEY"] = "test_plugin_daemon_key"
-            logger.info(
-                "Dify Plugin Daemon container started successfully - Host: %s, Port: %s",
-                plugin_daemon_host,
-                plugin_daemon_port,
-            )
+    def start_containers_with_env(self, services: frozenset[str] = _ALL_CONTAINER_SERVICES) -> None:
+        """
+        Start all required containers for integration testing.
 
-            logger.info("Dify Plugin Daemon container is ready and accepting connections")
-        except Exception as e:
-            logger.warning("Failed to start Dify Plugin Daemon container: %s", e)
-            logger.info("Continuing without plugin daemon - some tests may be limited")
-            self.dify_plugin_daemon = None
+        This method initializes and starts PostgreSQL, Redis
+        containers with appropriate configurations for Dify testing. Containers
+        are started in dependency order to ensure proper initialization.
+        """
+        if self._started_services:
+            logger.info("Containers already started - skipping container startup")
+            return
 
-        self._containers_started = True
-        logger.info("All test containers started successfully")
+        requested_services = set(services)
+        if "plugin-daemon" in requested_services:
+            requested_services.add("redis")
+        requested_services.add("postgres")
+
+        unknown_services = requested_services - _ALL_CONTAINER_SERVICES
+        if unknown_services:
+            raise ValueError(f"Unknown testcontainer services: {sorted(unknown_services)}")
+
+        os.environ["REDIS_HOST"] = "127.0.0.1"
+        os.environ["REDIS_PORT"] = "1"
+        os.environ["CODE_EXECUTION_ENDPOINT"] = "http://127.0.0.1:1"
+        os.environ["CODE_EXECUTION_API_KEY"] = "test_api_key"
+        os.environ["PLUGIN_DAEMON_URL"] = "http://127.0.0.1:1"
+        os.environ["PLUGIN_DAEMON_KEY"] = "test_plugin_daemon_key"
+
+        logger.info("Starting testcontainer services: %s", ", ".join(sorted(requested_services)))
+        self._start_postgres(create_plugin_database="plugin-daemon" in requested_services)
+        if "redis" in requested_services:
+            self._start_redis()
+        if "sandbox" in requested_services:
+            self._start_sandbox()
+        if "plugin-daemon" in requested_services:
+            self._start_plugin_daemon()
+        logger.info("Requested testcontainer services started successfully")
 
     def stop_containers(self) -> None:
         """
@@ -260,12 +355,12 @@ class DifyTestContainers:
         This method ensures proper cleanup of all containers to prevent
         resource leaks and conflicts between test runs.
         """
-        if not self._containers_started:
+        if not self._started_services:
             logger.info("No containers to stop - containers were not started")
             return
 
         logger.info("Stopping and cleaning up test containers...")
-        containers = [self.redis, self.postgres, self.dify_sandbox, self.dify_plugin_daemon]
+        containers = [self.dify_plugin_daemon, self.dify_sandbox, self.redis, self.postgres]
         for container in containers:
             if container:
                 container_name = container.image
@@ -279,7 +374,12 @@ class DifyTestContainers:
             self.network.remove()
             logger.info("Successfully removed Docker network")
 
-        self._containers_started = False
+        self.network = None
+        self.postgres = None
+        self.redis = None
+        self.dify_sandbox = None
+        self.dify_plugin_daemon = None
+        self._started_services.clear()
         logger.info("All test containers stopped and cleaned up successfully")
 
 
@@ -390,7 +490,7 @@ def _create_app_with_containers() -> Flask:
 
 
 @pytest.fixture(scope="session")
-def set_up_containers_and_env() -> Generator[DifyTestContainers, None, None]:
+def set_up_containers_and_env(request: pytest.FixtureRequest) -> Generator[DifyTestContainers, None, None]:
     """
     Session-scoped fixture to manage test containers.
 
@@ -402,7 +502,8 @@ def set_up_containers_and_env() -> Generator[DifyTestContainers, None, None]:
         DifyTestContainers: Container manager instance
     """
     logger.info("=== Starting test session container management ===")
-    _container_manager.start_containers_with_env()
+    services = _parse_requested_services(request.config.getoption("tc_services"), request.session.items)
+    _container_manager.start_containers_with_env(services)
     logger.info("Test containers ready for session")
     yield _container_manager
     logger.info("=== Cleaning up test session containers ===")
@@ -499,6 +600,21 @@ def db_session_with_containers(flask_app_with_containers: Flask) -> Generator[Se
             logger.debug("Database session closed")
 
 
+@pytest.fixture
+def transactional_db_session(
+    request: pytest.FixtureRequest,
+    flask_app_with_containers: Flask,
+) -> Generator[Session, None, None]:
+    request.node.add_marker(pytest.mark.no_container_truncate)
+    with bind_test_transaction(flask_app_with_containers) as session:
+        yield session
+
+
+@pytest.fixture
+def database_state(transactional_db_session: Session) -> DatabaseState:
+    return DatabaseState(transactional_db_session)
+
+
 def _truncate_container_database(app: Flask) -> None:
     """
     Reset application tables after a container integration test.
@@ -556,9 +672,10 @@ def isolate_container_database(request: pytest.FixtureRequest) -> Generator[None
 
     app = request.getfixturevalue("flask_app_with_containers")
     assert isinstance(app, Flask)
-    try:
+    skip_truncate = request.node.get_closest_marker("no_container_truncate") is not None
+    if not skip_truncate:
         _truncate_container_database(app)
-    finally:
+    if "redis" in _container_manager.started_services:
         _flush_container_redis(app)
 
 
