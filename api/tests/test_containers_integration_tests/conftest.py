@@ -644,6 +644,16 @@ def database_session_with_containers(database_app_with_containers: Flask) -> Gen
 
 
 @pytest.fixture
+def transactional_database_session(
+    request: pytest.FixtureRequest,
+    database_app_with_containers: Flask,
+) -> Generator[Session, None, None]:
+    request.node.add_marker(pytest.mark.no_container_truncate)
+    with bind_test_transaction(database_app_with_containers) as session:
+        yield session
+
+
+@pytest.fixture
 def transactional_db_session(
     request: pytest.FixtureRequest,
     flask_app_with_containers: Flask,
