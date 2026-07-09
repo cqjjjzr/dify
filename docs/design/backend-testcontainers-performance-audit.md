@@ -41,6 +41,72 @@ Five representative controller files now use transaction isolation: API keys, ex
 
 Measured together, the five migrated groups completed 38 tests in 12.59 seconds. Their slowest request body was under 0.1 seconds after the API-key deletion test was marked as requiring Redis. By comparison, 13 retained truncate-isolated file-upload and statistic tests completed in 49.56 seconds. Those two paths exposed concrete blockers: `FileService(db.engine)` requires an Engine, while statistic controllers call `db.engine.begin()` directly.
 
+## Deeper Fixed-Cost Profile (2026-07-10)
+
+The 38-test result hides substantial work before and after pytest's reported duration. A profiled run with normal plugin autoload reported 12.74 seconds in pytest but took 27.58 seconds wall time and 672 MiB peak RSS.
+
+| Layer | Measured cost |
+| --- | ---: |
+| Pytest plugin/conftest imports before session start | 9.77s |
+| Postgres and Redis startup | 4.86s |
+| `create_app()` | 0.94-1.50s |
+| `db.create_all()` | 2.88-4.04s |
+| 38 test call phases | 1.00-1.33s |
+| Savepoint enter and exit, 35 tests | 0.057-0.068s total |
+| Redis flush, 35 tests | 0.018-0.022s total |
+| Container shutdown | 0.91s |
+
+The nested transaction implementation is not a material bottleneck. Across the representative run, test SQL took about 0.56 seconds; savepoint control statements accounted for about 0.17 seconds of that total.
+
+### Pytest Plugin Autoload
+
+Disabling automatic third-party plugin discovery and loading only `pytest-env` reduced the same run's wall time from 27.58 to 23.03 seconds and peak RSS from 672 MiB to 469 MiB. The unrelated Opik pytest plugin eagerly imports `opik.evaluation`, LiteLLM, and LangSmith; import-time profiling attributed about 2.06 seconds to the Opik evaluation chain alone.
+
+Local Testcontainers commands should therefore use `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` and explicitly load the small set of required plugins. CI can keep a broader plugin set where coverage, timeout, or reporting plugins are intentional.
+
+### Backend Import Floor
+
+A validator-only test with a 0.00011-second body and no containers took 10.41 seconds wall with minimal pytest plugins, or 14.82 seconds with normal plugin autoload. Isolated warm-process import measurements were:
+
+| Import | Wall time | Peak RSS |
+| --- | ---: | ---: |
+| Python process only | 0.01s | 13 MiB |
+| `pytest` | 0.17s | 29 MiB |
+| `core.app.workflow.file_runtime` | 4.90s | 335 MiB |
+| `file_runtime.py` with package `__init__` bypassed | 3.25s | 176 MiB |
+| `app_factory` | 8.29s | 407 MiB |
+
+`api/tests/conftest.py` universally imports `core.app.workflow.file_runtime`. Importing that submodule first executes `core.app.workflow.__init__`, whose eager `DifyNodeFactory` import loads the workflow node and document-extractor graph. Making that package initializer lazy would save about 1.65 seconds, but the runtime module's own database, storage, and remote-fetch dependencies still cost about 3.25 seconds. The binding fixture should not impose this import on tests that do not exercise workflow files.
+
+The Testcontainers conftest also imports `app_factory` at module load. `app_factory` imports controller route packages eagerly, so even schema-only tests and tests that never request the Flask app pay much of the application import graph. Lazy fixture imports alone will not solve controller test-module imports, because `controllers.console.__init__` also performs aggregate route registration.
+
+### Schema DDL
+
+SQL instrumentation showed that `db.create_all()` emits 351 `CREATE` statements. In a normal ephemeral Postgres container, those statements consumed 2.61-3.72 seconds; schema inspection queries consumed only about 0.07 seconds.
+
+An ephemeral benchmark with `fsync=off`, `synchronous_commit=off`, and `full_page_writes=off` reduced `db.create_all()` from 2.88 to 0.89 seconds and raw `CREATE` execution from 2.61 to 0.68 seconds. Postgres startup remained about 4.9 seconds. Non-durable settings are appropriate only for disposable local/CI test databases, but they provide a concrete two-second setup improvement.
+
+### Persistent Local Database Probe
+
+A temporary Postgres container was kept alive across separate pytest processes. The first process, excluding container startup, created the schema and completed one concrete controller test in 2.78 seconds. A warm-schema process completed in 1.85 seconds:
+
+| Warm process layer | Time |
+| --- | ---: |
+| `create_app()` | 1.49s |
+| Existing-schema `db.create_all()` inspection | 0.087s |
+| Request and assertions | 0.035s |
+| Container startup/teardown | 0s |
+
+The first reuse attempt failed because `_UUIDv7SQL` unconditionally executes `CREATE FUNCTION`. Persistent mode requires idempotent UUID function setup, for example `CREATE OR REPLACE FUNCTION` or an explicit existence check.
+
+A broader warm Postgres-only selection reached 46 passing tests in 6.10 seconds inside pytest, with 1.24 seconds in test bodies and 0.080 seconds in schema inspection. It also exposed a stale `TestDataSourceNotionListApi.test_get_invalid_dataset_type` patch of the removed `controllers.console.datasets.data_source.sessionmaker` symbol; the patch and its unnecessary `mock_engine` dependency were subsequently removed.
+
+### Local Virtualenv Isolation
+
+This worktree's `api/.venv` was a symlink to `/home/chariri/dify/api/.venv`, shared by multiple checkouts. Concurrent `uv` runs rewrote editable `.pth` files between `/home/chariri/dify`, `/home/chariri/dify-2`, and `/home/chariri/dify-3`; consecutive `--no-sync` test runs reproduced `ImportError` failures from the wrong `dify_agent` checkout.
+
+The symlink was replaced locally with a real `/home/chariri/dify-3/api/.venv` and synchronized from the lockfile. `uv run --no-sync` now resolves the interpreter and all editable workspace packages from this worktree without reinstall churn. Every active worktree should own its virtualenv; sharing `.venv` across worktrees is unsafe.
+
 ## Current Backend Test Architecture
 
 Backend tests are distributed across these main areas:
@@ -51,17 +117,17 @@ Backend tests are distributed across these main areas:
 - `api/tests/test_containers_integration_tests`: Docker/Testcontainers-backed tests.
 - Provider tests under `api/providers/*/tests`.
 
-Current Makefile behavior:
+Current Makefile behavior after the implementation update:
 
-- `make test` runs backend unit tests with `-n auto`, then controller unit tests without xdist.
+- `make test` runs backend unit tests and controller unit tests without xdist.
 - `make test-all` runs unit tests, controller unit tests, integration tests, Testcontainers tests, and VDB smoke tests.
-- `make test-all` currently runs integration and Testcontainers paths with `--start-middleware -n auto`.
-- `TARGET_TESTS=... make test` and `TARGET_TESTS=... make test-all` run the target path directly and do not add `-n auto`.
+- `make test-all` runs Compose-backed integration tests and Testcontainers tests as separate, non-xdist pytest processes.
+- `TARGET_TESTS=... make test` and `TARGET_TESTS=... make test-all` run the target path directly without xdist.
 
 Current CI behavior:
 
 - Unit tests use `-n auto` except controller unit tests.
-- Integration and Testcontainers tests use `--start-middleware -n auto`.
+- Compose-backed integration tests and Testcontainers tests run separately without xdist; Testcontainers uses `--tc-services=auto`.
 
 The root pytest hook in `api/conftest.py` manages Docker Compose middleware and VDB services for older integration paths via `--start-middleware` and `--start-vdb`. The Testcontainers suite has its own container manager in `api/tests/test_containers_integration_tests/conftest.py`.
 
@@ -105,10 +171,8 @@ The main Testcontainers fixture is in `api/tests/test_containers_integration_tes
 Current container startup:
 
 - Creates a Docker network.
-- Starts Postgres.
-- Starts Redis.
-- Starts Dify Sandbox.
-- Starts Dify Plugin Daemon.
+- Always starts Postgres for app-backed Testcontainers tests.
+- Starts Redis, Dify Sandbox, and Dify Plugin Daemon only when collection-time markers or path/source detection select them.
 - Sets application environment variables from container host/port details.
 
 Current Flask app creation:
@@ -128,13 +192,13 @@ Current DB/session fixtures:
 Current isolation:
 
 - An autouse fixture checks whether the selected test used `flask_app_with_containers`.
-- If yes, it truncates all SQLAlchemy metadata tables:
+- Unless `no_container_truncate` is set by the transaction fixture or test, it truncates all SQLAlchemy metadata tables:
 
   ```sql
   TRUNCATE TABLE <all tables> RESTART IDENTITY CASCADE
   ```
 
-- It then flushes Redis.
+- It flushes Redis only when Redis was started.
 
 This gives broad isolation even for application code that commits through global sessions or ad hoc engine-bound sessions. The cost is that every app-backed test pays a full-table truncate.
 
@@ -728,4 +792,4 @@ The key changes are:
 - Gradually refactor dirty session paths so clean endpoints can use nested transaction/savepoint isolation.
 - Add persistent local environment support for tight agentic edit loops.
 
-The biggest immediate win is selective service startup: Postgres-only app/schema startup is already proven to work, and avoiding Sandbox/Plugin Daemon startup/teardown removes a large fixed cost from local partial runs.
+The biggest immediate wins are selective service startup and minimal pytest plugin loading. For tight single-test loops, the dominant remaining cost is eager backend import architecture; for database-backed loops, persistent Postgres plus idempotent schema bootstrap removes container lifecycle and repeated DDL while preserving concrete behavior verification.
