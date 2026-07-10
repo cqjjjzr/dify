@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from flask.testing import FlaskClient
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models import Account
-from models.account import TenantAccountRole
+from models import Account, TenantAccountJoin
+from models.account import AccountStatus, TenantAccountRole
 from tests.test_containers_integration_tests.controllers.openapi.conftest import BearerFactory, add_tenant_for_account
 
 pytestmark = pytest.mark.requires_redis
@@ -145,3 +148,98 @@ class TestWorkspaceSwitch:
 
         assert response.status_code == 404
         assert response.get_json() is not None
+
+
+class TestWorkspaceMembers:
+    def test_list_update_and_delete_member_persist(
+        self,
+        test_client_with_containers: FlaskClient,
+        transactional_db_session: Session,
+        make_transactional_account: Callable[..., Account],
+        account_bearer_factory: BearerFactory,
+    ) -> None:
+        owner = make_transactional_account()
+        tenant = owner.current_tenant
+        assert tenant is not None
+        member = make_transactional_account()
+        tenant_id = tenant.id
+        owner_id = owner.id
+        member_id = member.id
+        transactional_db_session.add(
+            TenantAccountJoin(
+                tenant_id=tenant_id,
+                account_id=member_id,
+                role=TenantAccountRole.NORMAL,
+                current=False,
+            )
+        )
+        transactional_db_session.commit()
+        headers, _mint = account_bearer_factory(owner)
+        members_url = f"/openapi/v1/workspaces/{tenant_id}/members"
+
+        list_response = test_client_with_containers.get(members_url, headers=headers)
+        assert list_response.status_code == 200
+        listed_ids = {item["id"] for item in list_response.get_json()["data"]}
+        assert {owner_id, member_id} <= listed_ids
+
+        update_response = test_client_with_containers.put(
+            f"{members_url}/{member_id}/role",
+            headers=headers,
+            json={"role": "admin"},
+        )
+        assert update_response.status_code == 200
+        transactional_db_session.expire_all()
+        membership = transactional_db_session.scalars(
+            select(TenantAccountJoin).where(
+                TenantAccountJoin.tenant_id == tenant_id,
+                TenantAccountJoin.account_id == member_id,
+            )
+        ).one()
+        assert membership.role == TenantAccountRole.ADMIN
+
+        delete_response = test_client_with_containers.delete(f"{members_url}/{member_id}", headers=headers)
+        assert delete_response.status_code == 200
+        remaining = transactional_db_session.scalar(
+            select(func.count())
+            .select_from(TenantAccountJoin)
+            .where(
+                TenantAccountJoin.tenant_id == tenant_id,
+                TenantAccountJoin.account_id == member_id,
+            )
+        )
+        assert remaining == 0
+
+    def test_invite_member_persists_pending_account(
+        self,
+        test_client_with_containers: FlaskClient,
+        transactional_db_session: Session,
+        make_transactional_account: Callable[..., Account],
+        account_bearer_factory: BearerFactory,
+    ) -> None:
+        owner = make_transactional_account()
+        tenant = owner.current_tenant
+        assert tenant is not None
+        tenant_id = tenant.id
+        invitee_email = f"openapi-invite-{uuid4()}@example.com"
+        headers, _mint = account_bearer_factory(owner)
+
+        with patch("services.account_service.send_invite_member_mail_task.delay") as send_mail:
+            response = test_client_with_containers.post(
+                f"/openapi/v1/workspaces/{tenant_id}/members",
+                headers=headers,
+                json={"email": invitee_email, "role": "normal"},
+            )
+
+        assert response.status_code == 201
+        payload = response.get_json()
+        assert payload["email"] == invitee_email
+        invitee = transactional_db_session.scalars(select(Account).where(Account.email == invitee_email)).one()
+        assert invitee.status == AccountStatus.PENDING
+        membership = transactional_db_session.scalars(
+            select(TenantAccountJoin).where(
+                TenantAccountJoin.tenant_id == tenant_id,
+                TenantAccountJoin.account_id == invitee.id,
+            )
+        ).one()
+        assert membership.role == TenantAccountRole.NORMAL
+        send_mail.assert_called_once()

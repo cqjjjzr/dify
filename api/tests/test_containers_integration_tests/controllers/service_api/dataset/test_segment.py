@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from flask.testing import FlaskClient
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
@@ -154,3 +156,111 @@ def test_list_child_chunks_uses_real_segment_service(
     assert set(body) == {"data", "total", "total_pages", "page", "limit"}
     assert body["total"] == 1
     assert body["data"][0]["content"] == "Child integration content"
+
+
+def test_create_get_update_and_delete_segment_persist(
+    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+) -> None:
+    dataset, document, _segment = _create_dataset_graph(transactional_db_session)
+    dataset_id = dataset.id
+    document_id = document.id
+    headers = _auth_headers(transactional_db_session, dataset)
+    segments_url = f"/v1/datasets/{dataset_id}/documents/{document_id}/segments"
+
+    with patch("services.dataset_service.VectorService.create_segments_vector"):
+        create_response = test_client_with_containers.post(
+            segments_url,
+            headers=headers,
+            json={
+                "segments": [
+                    {
+                        "content": "Service API created segment",
+                        "keywords": ["service-api"],
+                        "attachment_ids": [],
+                    }
+                ]
+            },
+        )
+
+    assert create_response.status_code == 200
+    created_id = create_response.get_json()["data"][0]["id"]
+    assert transactional_db_session.get(DocumentSegment, created_id).content == "Service API created segment"
+    segment_url = f"{segments_url}/{created_id}"
+
+    get_response = test_client_with_containers.get(segment_url, headers=headers)
+    assert get_response.status_code == 200
+    assert get_response.get_json()["data"]["id"] == created_id
+
+    with (
+        patch("services.dataset_service.VectorService.update_segment_vector"),
+        patch("services.dataset_service.VectorService.update_multimodel_vector"),
+    ):
+        update_response = test_client_with_containers.post(
+            segment_url,
+            headers=headers,
+            json={
+                "segment": {
+                    "content": "Service API updated segment",
+                    "keywords": ["updated"],
+                    "attachment_ids": [],
+                }
+            },
+        )
+
+    assert update_response.status_code == 200
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(DocumentSegment, created_id).content == "Service API updated segment"
+
+    with patch("services.dataset_service.delete_segment_from_index_task.delay") as delete_index:
+        delete_response = test_client_with_containers.delete(segment_url, headers=headers)
+
+    assert delete_response.status_code == 204
+    assert transactional_db_session.get(DocumentSegment, created_id) is None
+    delete_index.assert_called_once()
+
+
+def test_create_update_and_delete_child_chunk_persist(
+    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+) -> None:
+    dataset, document, segment = _create_dataset_graph(transactional_db_session)
+    dataset_id = dataset.id
+    document_id = document.id
+    segment_id = segment.id
+    headers = _auth_headers(transactional_db_session, dataset)
+    child_chunks_url = (
+        f"/v1/datasets/{dataset_id}/documents/{document_id}/segments/{segment_id}/child_chunks"
+    )
+
+    with patch("services.dataset_service.VectorService.create_child_chunk_vector"):
+        create_response = test_client_with_containers.post(
+            child_chunks_url,
+            headers=headers,
+            json={"content": "Service API child chunk"},
+        )
+
+    assert create_response.status_code == 200
+    child_chunk_id = create_response.get_json()["data"]["id"]
+    assert transactional_db_session.get(ChildChunk, child_chunk_id).content == "Service API child chunk"
+    child_chunk_url = f"{child_chunks_url}/{child_chunk_id}"
+
+    with patch("services.dataset_service.VectorService.update_child_chunk_vector"):
+        update_response = test_client_with_containers.patch(
+            child_chunk_url,
+            headers=headers,
+            json={"content": "Service API updated child"},
+        )
+
+    assert update_response.status_code == 200
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(ChildChunk, child_chunk_id).content == "Service API updated child"
+
+    with patch("services.dataset_service.VectorService.delete_child_chunk_vector"):
+        delete_response = test_client_with_containers.delete(child_chunk_url, headers=headers)
+
+    assert delete_response.status_code == 204
+    remaining = transactional_db_session.scalar(
+        select(func.count()).select_from(ChildChunk).where(ChildChunk.id == child_chunk_id)
+    )
+    assert remaining == 0
