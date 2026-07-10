@@ -185,3 +185,71 @@ def test_update_response_masks_existing_plaintext_api_key_when_hidden_value_is_s
     extension = database_state.one(APIBasedExtension, APIBasedExtension.id == create_response.json["id"])
     assert extension.name == "Docs API Updated"
     assert extension.api_endpoint == "https://docs.example.com/v2"
+
+
+def test_code_based_extension_returns_requested_module(
+    transactional_db_session: Session,
+    test_client_with_containers: FlaskClient,
+) -> None:
+    account, _tenant = create_console_account_and_tenant(transactional_db_session)
+    headers = authenticate_console_client(test_client_with_containers, account)
+
+    with patch(
+        "controllers.console.extension.CodeBasedExtensionService.get_code_based_extension",
+        return_value={"enabled": True},
+    ) as get_extension:
+        response = test_client_with_containers.get(
+            "/console/api/code-based-extension?module=moderation",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"module": "moderation", "data": {"enabled": True}}
+    get_extension.assert_called_once_with("moderation")
+
+
+@pytest.mark.requires_redis
+def test_get_api_based_extension_detail(
+    api_extension_client: tuple[FlaskClient, dict[str, str], str],
+    database_state: DatabaseState,
+) -> None:
+    client, headers, tenant_id = api_extension_client
+    create_response = client.post(
+        "/console/api/api-based-extension",
+        headers=headers,
+        json={
+            "name": "Detail API",
+            "api_endpoint": "https://detail.example.com/hook",
+            "api_key": "detail-secret-12345",
+        },
+    )
+    extension_id = create_response.get_json()["id"]
+
+    response = client.get(f"/console/api/api-based-extension/{extension_id}", headers=headers)
+
+    assert response.status_code == 200
+    assert response.get_json()["name"] == "Detail API"
+    persisted = database_state.one(APIBasedExtension, APIBasedExtension.id == extension_id)
+    assert persisted.tenant_id == tenant_id
+
+
+def test_delete_api_based_extension_detail(
+    api_extension_client: tuple[FlaskClient, dict[str, str], str],
+    database_state: DatabaseState,
+) -> None:
+    client, headers, _tenant_id = api_extension_client
+    create_response = client.post(
+        "/console/api/api-based-extension",
+        headers=headers,
+        json={
+            "name": "Delete API",
+            "api_endpoint": "https://delete.example.com/hook",
+            "api_key": "delete-secret-12345",
+        },
+    )
+    extension_id = create_response.get_json()["id"]
+
+    response = client.delete(f"/console/api/api-based-extension/{extension_id}", headers=headers)
+
+    assert response.status_code == 204
+    assert database_state.count(APIBasedExtension, APIBasedExtension.id == extension_id) == 0
