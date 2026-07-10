@@ -165,6 +165,7 @@ class TestWorkspaceMembers:
         tenant_id = tenant.id
         owner_id = owner.id
         member_id = member.id
+        member_email = member.email
         transactional_db_session.add(
             TenantAccountJoin(
                 tenant_id=tenant_id,
@@ -182,6 +183,15 @@ class TestWorkspaceMembers:
         listed_ids = {item["id"] for item in list_response.get_json()["data"]}
         assert {owner_id, member_id} <= listed_ids
 
+        with patch("services.account_service.send_invite_member_mail_task.delay") as send_mail:
+            duplicate_invite_response = test_client_with_containers.post(
+                members_url,
+                headers=headers,
+                json={"email": member_email, "role": "normal"},
+            )
+        assert duplicate_invite_response.status_code == 400
+        send_mail.assert_not_called()
+
         update_response = test_client_with_containers.put(
             f"{members_url}/{member_id}/role",
             headers=headers,
@@ -196,6 +206,16 @@ class TestWorkspaceMembers:
             )
         ).one()
         assert membership.role == TenantAccountRole.ADMIN
+
+        same_role_response = test_client_with_containers.put(
+            f"{members_url}/{member_id}/role",
+            headers=headers,
+            json={"role": "admin"},
+        )
+        assert same_role_response.status_code == 400
+
+        self_remove_response = test_client_with_containers.delete(f"{members_url}/{owner_id}", headers=headers)
+        assert self_remove_response.status_code == 400
 
         delete_response = test_client_with_containers.delete(f"{members_url}/{member_id}", headers=headers)
         assert delete_response.status_code == 200

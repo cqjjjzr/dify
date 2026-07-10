@@ -227,7 +227,7 @@ def test_bulk_delete_segments_persists(
     delete_index.assert_called_once()
 
 
-def test_disable_segment_persists_status(
+def test_disable_and_enable_segment_persist_status(
     test_client_with_containers: FlaskClient,
     transactional_db_session: Session,
     console_segment_graph: ConsoleSegmentGraph,
@@ -244,6 +244,18 @@ def test_disable_segment_persists_status(
     transactional_db_session.expire_all()
     assert transactional_db_session.get(DocumentSegment, graph.segment_id).enabled is False
     disable_index.assert_called_once()
+
+    with patch("services.dataset_service.enable_segments_to_index_task.delay") as enable_index:
+        enable_response = test_client_with_containers.patch(
+            f"/console/api/datasets/{graph.dataset_id}/documents/{graph.document_id}/segment/enable"
+            f"?segment_id={graph.segment_id}",
+            headers=graph.headers,
+        )
+
+    assert enable_response.status_code == 200
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(DocumentSegment, graph.segment_id).enabled is True
+    enable_index.assert_called_once_with([graph.segment_id], graph.dataset_id, graph.document_id)
 
 
 def test_create_update_and_delete_segment_persist(
@@ -287,6 +299,31 @@ def test_create_update_and_delete_segment_persist(
     assert delete_response.status_code == 204
     assert transactional_db_session.get(DocumentSegment, created_id) is None
     delete_index.assert_called_once()
+
+
+def test_segment_index_failure_persists_error_state(
+    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+    console_segment_graph: ConsoleSegmentGraph,
+) -> None:
+    graph = console_segment_graph
+    with patch(
+        "services.dataset_service.VectorService.create_segments_vector",
+        side_effect=RuntimeError("index unavailable"),
+    ):
+        response = test_client_with_containers.post(
+            f"/console/api/datasets/{graph.dataset_id}/documents/{graph.document_id}/segment",
+            headers=graph.headers,
+            json={"content": "Persisted index failure", "attachment_ids": []},
+        )
+
+    assert response.status_code == 200
+    segment = transactional_db_session.scalars(
+        select(DocumentSegment).where(DocumentSegment.content == "Persisted index failure")
+    ).one()
+    assert segment.status == SegmentStatus.ERROR
+    assert segment.enabled is False
+    assert segment.error == "index unavailable"
 
 
 def test_batch_import_start_and_status_use_real_redis_state(
@@ -402,3 +439,58 @@ def test_update_and_delete_child_chunk_persist(
 
     assert delete_response.status_code == 204
     assert transactional_db_session.get(ChildChunk, graph.child_chunk_id) is None
+
+
+def test_child_chunk_index_failures_roll_back_all_mutations(
+    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+    console_segment_graph: ConsoleSegmentGraph,
+) -> None:
+    graph = console_segment_graph
+    child_chunks_url = f"{_segments_url(graph)}/{graph.segment_id}/child_chunks"
+    original_count = transactional_db_session.scalar(
+        select(func.count()).select_from(ChildChunk).where(ChildChunk.segment_id == graph.segment_id)
+    )
+
+    with patch(
+        "services.dataset_service.VectorService.create_child_chunk_vector",
+        side_effect=RuntimeError("create index failed"),
+    ):
+        create_response = test_client_with_containers.post(
+            child_chunks_url,
+            headers=graph.headers,
+            json={"content": "Must roll back"},
+        )
+
+    assert create_response.status_code == 500
+    assert (
+        transactional_db_session.scalar(
+            select(func.count()).select_from(ChildChunk).where(ChildChunk.segment_id == graph.segment_id)
+        )
+        == original_count
+    )
+
+    child_chunk_url = f"{child_chunks_url}/{graph.child_chunk_id}"
+    with patch(
+        "services.dataset_service.VectorService.update_child_chunk_vector",
+        side_effect=RuntimeError("update index failed"),
+    ):
+        update_response = test_client_with_containers.patch(
+            child_chunk_url,
+            headers=graph.headers,
+            json={"content": "Must not persist"},
+        )
+
+    assert update_response.status_code == 500
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(ChildChunk, graph.child_chunk_id).content == "Initial child chunk"
+
+    with patch(
+        "services.dataset_service.VectorService.delete_child_chunk_vector",
+        side_effect=RuntimeError("delete index failed"),
+    ):
+        delete_response = test_client_with_containers.delete(child_chunk_url, headers=graph.headers)
+
+    assert delete_response.status_code == 500
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(ChildChunk, graph.child_chunk_id) is not None

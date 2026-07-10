@@ -135,15 +135,25 @@ class TestMemberCancelInviteApiWithContainers:
             tenant=tenant,
             role=TenantAccountRole.NORMAL,
         )
+        current_user_id = current_user.id
+        headers = _headers(test_client_with_containers, current_user)
 
         response = test_client_with_containers.delete(
             f"/console/api/workspaces/current/members/{member.id}",
-            headers=_headers(test_client_with_containers, current_user),
+            headers=headers,
         )
 
         assert response.status_code == 200
         assert response.get_json()["result"] == "success"
         assert factory.join_count(transactional_db_session, tenant=tenant, account=member) == 0
+
+        self_remove_response = test_client_with_containers.delete(
+            f"/console/api/workspaces/current/members/{current_user_id}",
+            headers=headers,
+        )
+        assert self_remove_response.status_code == 400
+        assert self_remove_response.get_json()["code"] == "cannot-operate-self"
+        assert factory.join_count(transactional_db_session, tenant=tenant, account=current_user) == 1
 
     def test_cancel_not_found(
         self, test_client_with_containers: FlaskClient, transactional_db_session: Session
@@ -199,10 +209,12 @@ class TestMemberUpdateRoleApiWithContainers:
             tenant=tenant,
             role=TenantAccountRole.EDITOR,
         )
+        member_id = member.id
+        headers = _headers(test_client_with_containers, current_user)
 
         response = test_client_with_containers.put(
-            f"/console/api/workspaces/current/members/{member.id}/update-role",
-            headers=_headers(test_client_with_containers, current_user),
+            f"/console/api/workspaces/current/members/{member_id}/update-role",
+            headers=headers,
             json={"role": "normal"},
         )
 
@@ -212,6 +224,14 @@ class TestMemberUpdateRoleApiWithContainers:
             factory.get_join(transactional_db_session, tenant=tenant, account=member).role
             == TenantAccountRole.NORMAL
         )
+
+        same_role_response = test_client_with_containers.put(
+            f"/console/api/workspaces/current/members/{member_id}/update-role",
+            headers=headers,
+            json={"role": "normal"},
+        )
+        assert same_role_response.status_code == 400
+        assert same_role_response.get_json()["code"] == "role-already-assigned"
 
     def test_update_member_not_found(
         self, test_client_with_containers: FlaskClient, transactional_db_session: Session
@@ -283,11 +303,13 @@ class TestMemberReadAndInviteApisWithContainers:
         factory = WorkspaceMembersIntegrationFactory
         tenant, current_user = factory.create_owner_workspace(transactional_db_session)
         invitee_email = f"invitee-{uuid4()}@example.com"
+        tenant_id = tenant.id
+        headers = _headers(test_client_with_containers, current_user)
 
         with patch("services.account_service.send_invite_member_mail_task.delay") as send_mail:
             response = test_client_with_containers.post(
                 "/console/api/workspaces/current/members/invite-email",
-                headers=_headers(test_client_with_containers, current_user),
+                headers=headers,
                 json={"emails": [invitee_email], "role": "normal", "language": "en-US"},
             )
 
@@ -301,6 +323,25 @@ class TestMemberReadAndInviteApisWithContainers:
             == TenantAccountRole.NORMAL
         )
         send_mail.assert_called_once()
+
+        invitee_id = invitee.id
+        cancel_response = test_client_with_containers.delete(
+            f"/console/api/workspaces/current/members/{invitee_id}",
+            headers=headers,
+        )
+        assert cancel_response.status_code == 200
+        assert transactional_db_session.get(Account, invitee_id) is None
+        assert (
+            transactional_db_session.scalar(
+                select(func.count())
+                .select_from(TenantAccountJoin)
+                .where(
+                    TenantAccountJoin.tenant_id == tenant_id,
+                    TenantAccountJoin.account_id == invitee_id,
+                )
+            )
+            == 0
+        )
 
 
 class TestOwnerTransferSupportApisWithContainers:
@@ -327,10 +368,19 @@ class TestOwnerTransferSupportApisWithContainers:
     ) -> None:
         _tenant, current_user = WorkspaceMembersIntegrationFactory.create_owner_workspace(transactional_db_session)
         token = WorkspaceMembersIntegrationFactory.create_owner_transfer_token(current_user)
+        headers = _headers(test_client_with_containers, current_user)
+
+        wrong_code_response = test_client_with_containers.post(
+            "/console/api/workspaces/current/members/owner-transfer-check",
+            headers=headers,
+            json={"token": token, "code": "654321"},
+        )
+        assert wrong_code_response.status_code == 400
+        assert members_module.AccountService.get_owner_transfer_data(token)["code"] == "123456"
 
         response = test_client_with_containers.post(
             "/console/api/workspaces/current/members/owner-transfer-check",
-            headers=_headers(test_client_with_containers, current_user),
+            headers=headers,
             json={"token": token, "code": "123456"},
         )
 

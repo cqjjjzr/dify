@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
+from extensions.ext_redis import redis_client
 from models.dataset import ChildChunk, Dataset, Document, DocumentSegment, DocumentSegmentSummary
 from models.enums import (
     ApiTokenType,
@@ -264,3 +265,190 @@ def test_create_update_and_delete_child_chunk_persist(
         select(func.count()).select_from(ChildChunk).where(ChildChunk.id == child_chunk_id)
     )
     assert remaining == 0
+
+
+def test_update_keyword_status_and_index_failure_contracts(
+    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+) -> None:
+    dataset, document, segment = _create_dataset_graph(transactional_db_session)
+    dataset_id = dataset.id
+    document_id = document.id
+    segment_id = segment.id
+    original_content = segment.content
+    headers = _auth_headers(transactional_db_session, dataset)
+    segment_url = f"/v1/datasets/{dataset_id}/documents/{document_id}/segments/{segment_id}"
+
+    with (
+        patch("services.dataset_service.VectorService.update_segment_vector") as update_vector,
+        patch("services.dataset_service.VectorService.update_multimodel_vector"),
+    ):
+        keyword_response = test_client_with_containers.post(
+            segment_url,
+            headers=headers,
+            json={"segment": {"content": original_content, "keywords": ["replacement"]}},
+        )
+    assert keyword_response.status_code == 200
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(DocumentSegment, segment_id).keywords == ["replacement"]
+    update_vector.assert_called_once()
+
+    with patch("services.dataset_service.disable_segment_from_index_task.delay") as disable_index:
+        disable_response = test_client_with_containers.post(
+            segment_url,
+            headers=headers,
+            json={"segment": {"enabled": False}},
+        )
+    assert disable_response.status_code == 200
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(DocumentSegment, segment_id).enabled is False
+    disable_index.assert_called_once_with(segment_id)
+
+    blocked_enable_response = test_client_with_containers.post(
+        segment_url,
+        headers=headers,
+        json={"segment": {"enabled": True, "content": "Blocked by indexing lock"}},
+    )
+    assert blocked_enable_response.status_code == 400
+    transactional_db_session.expire_all()
+    assert transactional_db_session.get(DocumentSegment, segment_id).enabled is False
+
+    redis_client.delete(f"segment_{segment_id}_indexing")
+
+    with (
+        patch("services.dataset_service.VectorService.update_segment_vector"),
+        patch("services.dataset_service.VectorService.update_multimodel_vector"),
+    ):
+        enable_response = test_client_with_containers.post(
+            segment_url,
+            headers=headers,
+            json={"segment": {"enabled": True, "content": "Re-enabled content"}},
+        )
+    assert enable_response.status_code == 200
+    transactional_db_session.expire_all()
+    reenabled_segment = transactional_db_session.get(DocumentSegment, segment_id)
+    assert reenabled_segment.enabled is True
+    assert reenabled_segment.content == "Re-enabled content"
+
+    with patch(
+        "services.dataset_service.VectorService.update_segment_vector",
+        side_effect=RuntimeError("update index unavailable"),
+    ):
+        failed_update_response = test_client_with_containers.post(
+            segment_url,
+            headers=headers,
+            json={"segment": {"content": "Persisted before index failure"}},
+        )
+    assert failed_update_response.status_code == 200
+    transactional_db_session.expire_all()
+    failed_segment = transactional_db_session.get(DocumentSegment, segment_id)
+    assert failed_segment.content == "Persisted before index failure"
+    assert failed_segment.status == SegmentStatus.ERROR
+    assert failed_segment.enabled is False
+    assert failed_segment.error == "update index unavailable"
+
+
+def test_create_preconditions_qa_and_batch_index_failure_contracts(
+    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+) -> None:
+    dataset, document, _segment = _create_dataset_graph(transactional_db_session)
+    dataset_id = dataset.id
+    document_id = document.id
+    headers = _auth_headers(transactional_db_session, dataset)
+    segments_url = f"/v1/datasets/{dataset_id}/documents/{document_id}/segments"
+
+    document.indexing_status = IndexingStatus.INDEXING
+    transactional_db_session.commit()
+    incomplete_response = test_client_with_containers.post(
+        segments_url,
+        headers=headers,
+        json={"segments": [{"content": "Rejected while indexing"}]},
+    )
+    assert incomplete_response.status_code == 404
+
+    persisted_document = transactional_db_session.get(Document, document_id)
+    persisted_document.indexing_status = IndexingStatus.COMPLETED
+    persisted_document.enabled = False
+    transactional_db_session.commit()
+    disabled_response = test_client_with_containers.post(
+        segments_url,
+        headers=headers,
+        json={"segments": [{"content": "Rejected while disabled"}]},
+    )
+    assert disabled_response.status_code == 404
+
+    persisted_document = transactional_db_session.get(Document, document_id)
+    persisted_document.enabled = True
+    persisted_document.doc_form = IndexStructureType.QA_INDEX
+    transactional_db_session.commit()
+    with patch("services.dataset_service.VectorService.create_segments_vector"):
+        qa_response = test_client_with_containers.post(
+            segments_url,
+            headers=headers,
+            json={"segments": [{"content": "QA question", "answer": "QA answer"}]},
+        )
+    assert qa_response.status_code == 200
+    qa_segment_id = qa_response.get_json()["data"][0]["id"]
+    qa_segment = transactional_db_session.get(DocumentSegment, qa_segment_id)
+    assert qa_segment.answer == "QA answer"
+    assert qa_segment.word_count == len("QA question") + len("QA answer")
+
+    with patch(
+        "services.dataset_service.VectorService.create_segments_vector",
+        side_effect=RuntimeError("batch index unavailable"),
+    ):
+        failed_batch_response = test_client_with_containers.post(
+            segments_url,
+            headers=headers,
+            json={
+                "segments": [
+                    {"content": "Failed question one", "answer": "Answer one"},
+                    {"content": "Failed question two", "answer": "Answer two"},
+                ]
+            },
+        )
+    assert failed_batch_response.status_code == 200
+    failed_ids = [item["id"] for item in failed_batch_response.get_json()["data"]]
+    failed_segments = transactional_db_session.scalars(
+        select(DocumentSegment).where(DocumentSegment.id.in_(failed_ids))
+    ).all()
+    assert len(failed_segments) == 2
+    assert all(segment.status == SegmentStatus.ERROR for segment in failed_segments)
+    assert all(segment.enabled is False for segment in failed_segments)
+    assert {segment.error for segment in failed_segments} == {"batch index unavailable"}
+
+
+def test_resource_hierarchy_mismatches_are_not_found(
+    test_client_with_containers: FlaskClient,
+    transactional_db_session: Session,
+) -> None:
+    dataset, document, segment = _create_dataset_graph(transactional_db_session)
+    dataset_id = dataset.id
+    document_id = document.id
+    segment_id = segment.id
+    headers = _auth_headers(transactional_db_session, dataset)
+    unknown_id = uuid4()
+
+    responses = [
+        test_client_with_containers.get(
+            f"/v1/datasets/{unknown_id}/documents/{document_id}/segments",
+            headers=headers,
+        ),
+        test_client_with_containers.get(
+            f"/v1/datasets/{dataset_id}/documents/{unknown_id}/segments",
+            headers=headers,
+        ),
+        test_client_with_containers.get(
+            f"/v1/datasets/{dataset_id}/documents/{document_id}/segments/{unknown_id}",
+            headers=headers,
+        ),
+        test_client_with_containers.patch(
+            f"/v1/datasets/{dataset_id}/documents/{document_id}/segments/{segment_id}"
+            f"/child_chunks/{unknown_id}",
+            headers=headers,
+            json={"content": "Unknown child"},
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [404, 404, 404, 404]
