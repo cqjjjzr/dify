@@ -73,7 +73,6 @@ BearerFactory = Callable[[Account], tuple[dict[str, str], MintResult]]
 def account_bearer_factory(transactional_db_session: Session) -> BearerFactory:
     def _mint(account: Account) -> tuple[dict[str, str], MintResult]:
         result = mint_oauth_token(
-            transactional_db_session,
             redis_client,
             subject_email=account.email,
             subject_issuer=None,
@@ -82,6 +81,7 @@ def account_bearer_factory(transactional_db_session: Session) -> BearerFactory:
             device_label=f"Test Device {uuid.uuid4()}",
             prefix=PREFIX_OAUTH_ACCOUNT,
             ttl_days=14,
+            session=transactional_db_session,
         )
         return {"Authorization": f"Bearer {result.token}"}, result
 

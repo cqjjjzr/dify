@@ -192,8 +192,8 @@ class TestWorkspaceMembers:
         assert duplicate_invite_response.status_code == 400
         send_mail.assert_not_called()
 
-        update_response = test_client_with_containers.put(
-            f"{members_url}/{member_id}/role",
+        update_response = test_client_with_containers.patch(
+            f"{members_url}/{member_id}",
             headers=headers,
             json={"role": "admin"},
         )
@@ -207,8 +207,8 @@ class TestWorkspaceMembers:
         ).one()
         assert membership.role == TenantAccountRole.ADMIN
 
-        same_role_response = test_client_with_containers.put(
-            f"{members_url}/{member_id}/role",
+        same_role_response = test_client_with_containers.patch(
+            f"{members_url}/{member_id}",
             headers=headers,
             json={"role": "admin"},
         )
